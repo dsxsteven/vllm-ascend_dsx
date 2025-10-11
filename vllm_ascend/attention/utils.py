@@ -63,10 +63,6 @@ class AscendCommonAttentionMetadata:
 
     graph_pad_size: int = -1
 
-    # NOTE: This is a temporary solution for rotary embedding in MLA
-    cos: torch.Tensor = None
-    sin: torch.Tensor = None
-
 
 def split_decodes_and_prefills(
     common_attn_metadata: AscendCommonAttentionMetadata,

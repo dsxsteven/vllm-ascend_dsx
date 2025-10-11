@@ -39,8 +39,6 @@ from vllm_ascend.ops.attention import vanilla_chunked_prefill
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
                                nd_to_nz_2d, nd_to_nz_spec)
 
-from ..utils import weak_ref_tensors
-
 
 class AscendAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -239,7 +237,6 @@ class AscendAttentionMetadataBuilder:
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
         attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,
-        model: Optional[nn.Module] = None,
     ):
         if attn_state == AscendAttentionState.DecodeOnly:
             attn_metadata = self.build(
@@ -404,15 +401,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 graph_params.events[num_tokens].append(event)
 
                 graph_params.attn_params[num_tokens].append((
-                    weak_ref_tensors(query),
-                    weak_ref_tensors(self.key_cache),
-                    weak_ref_tensors(self.value_cache),
+                    query,
+                    self.key_cache,
+                    self.value_cache,
                     self.num_kv_heads,
                     self.num_heads,
                     self.scale,
-                    weak_ref_tensors(attn_metadata.block_tables),
+                    attn_metadata.block_tables,
                     attn_metadata.seq_lens,
-                    weak_ref_tensors(output),
+                    output,
                 ))
 
                 torch.npu.graph_task_group_begin(stream)
