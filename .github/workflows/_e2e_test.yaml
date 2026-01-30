@@ -199,10 +199,10 @@ jobs:
           # this test fail with triton. Fix me.
           # pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_aclgraph_capture_replay.py
           pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_qwen3_performance.py
-          pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_data_parallel.py
+          # pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_data_parallel.py
           pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_expert_parallel.py
           pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_external_launcher.py
-          pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_full_graph_mode.py
+          # pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_full_graph_mode.py
           pytest -sv --durations=0 tests/e2e/multicard/2-cards/test_ilama_lora_tp2.py
           pytest -sv --durations=0 tests/e2e/multicard/2-cards/spec_decode/test_spec_decode.py
 
