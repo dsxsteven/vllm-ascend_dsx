@@ -46,6 +46,7 @@ from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, maybe_trans_nz, weak_ref_tensors
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1228,6 +1229,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             k_pe = k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
 
         attn_output_shape: tuple | None = None
+        self.num_heads_padded = 1 << (self.num_heads - 1).bit_length()
+        padding_value = self.num_heads_padded - self.num_heads
+        actual_num_heads = self.num_heads_padded if padding_value > 0 else self.num_heads
         if (
             attn_metadata.attn_state
             in [
@@ -1245,8 +1249,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Input shape: [num_tokens, num_heads, dim]
             q_nope = q_nope.view(num_tokens, self.num_heads, -1).contiguous()
             q_pe = q_pe.view(num_tokens, self.num_heads, -1)
+
+            if padding_value > 0:
+                q_pe = F.pad(q_pe, (0, 0, 0, padding_value), "constant", 0)
+                q_nope = F.pad(q_nope, (0, 0, 0, padding_value), "constant", 0)
+
             # Output shape: [num_heads, num_tokens, dim]
-            attn_output_shape = (self.num_heads, num_tokens, self.kv_lora_rank)
+            attn_output_shape = (actual_num_heads, num_tokens, self.kv_lora_rank)
             sparse_mode = 3
             attn_mask = attn_metadata.decode.attn_mask  # type:ignore
             actual_seq_lengths = decode_meta.actual_seq_lengths_q
@@ -1263,32 +1272,18 @@ class AscendMLAImpl(MLAAttentionImpl):
                 input_layout = "BNSD_NBSD"
                 q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
+                if padding_value > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, padding_value), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, padding_value), "constant", 0)
             # Output shape: [num_heads, num_tokens, seq_len, dim]
-            attn_output_shape = (self.num_heads, num_tokens, 1, self.kv_lora_rank)
+            attn_output_shape = (actual_num_heads, num_tokens, 1, self.kv_lora_rank)
             sparse_mode = 0
             attn_mask = None
-        
-        # pad num_heads to 2power, B
-        if input_layout != "BNSD_NBSD" and input_layout != "TND_NTD":
-            raise NotImplementedError('[lzp flag] input_layout != "BNSD_NBSD"')
-
-        self.num_heads_padded = 1 << (self.num_heads - 1).bit_length()
-        padding_value = self.num_heads_padded - self.num_heads
-        if padding_value > 0:
-            import torch.nn.functional as F
-            if input_layout == "BNSD_NBSD":
-                q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, padding_value), "constant", 0)
-                q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, padding_value), "constant", 0)
-            elif input_layout == "TND_NTD":
-                q_pe = F.pad(q_pe, (0, 0, 0, padding_value), "constant", 0)
-                q_nope = F.pad(q_nope, (0, 0, 0, padding_value), "constant", 0)
-            # print(f"Padded shape: {q_pe.shape}")
-        
 
         common_kwargs = {
             "query_rope": q_pe,
             "key_rope": k_pe,
-            "num_heads": self.num_heads_padded, # lzp
+            "num_heads": actual_num_heads, # lzp
             "num_key_value_heads": self.num_kv_heads,
             "input_layout": input_layout,
             "atten_mask": attn_mask,
@@ -1323,7 +1318,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     update_draft_graph_params_workspaces(num_tokens, workspace)
                 else:
                     update_graph_params_workspaces(num_tokens, workspace)
-
+            
             attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
 
@@ -1333,7 +1328,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     weak_ref_tensors(k_nope),
                     weak_ref_tensors(q_pe),
                     weak_ref_tensors(k_pe),
-                    self.num_heads,
+                    actual_num_heads,
                     self.num_kv_heads,
                     input_layout,
                     weak_ref_tensors(attn_mask) if attn_mask is not None else None,
