@@ -986,7 +986,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if prefill_metadata is None or prefill_metadata.chunked_context is None:
             return prefix_output, prefix_lse
 
-        raise NotImplementedError(f"[GLM4.7-flash does not supoort chunked-prefill] eror in mla func _compute_prefill_context")
+        raise NotImplementedError(f"[GLM4.7-flash does not supoort chunked-prefill & prefix_cache] eror in mla func _compute_prefill_context")
         iters = len(prefill_metadata.chunked_context.seq_tot)
 
         current_seq_len = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
