@@ -64,7 +64,7 @@ class AttentionMaskBuilder:
                 mask_value = torch.finfo(torch.float32).min
             else:
                 mask_value = 1
-            prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=dtype), 1)
+            prefill_mask = torch.triu(torch.ones(2048, 2048, device=self.device, dtype=dtype), 1)
             self.mla_mask = torch.where(prefill_mask == 1, mask_value, 0).to(dtype)
         return self.mla_mask
 
