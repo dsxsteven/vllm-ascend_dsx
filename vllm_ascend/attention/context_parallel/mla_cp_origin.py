@@ -476,7 +476,6 @@ class AscendMlaCPImpl(AscendMLAImpl):
         assert attn_metadata.prefill is not None
         assert attn_metadata.prefill.pcp_metadata is not None
         num_tokens = q_nope.size(0)
-        prefill_meta = attn_metadata.prefill
         # Use precomputed indices from the metadata (already converted to tensors and on device)
         q_head_idx = attn_metadata.prefill.pcp_metadata.q_head_idx
         q_tail_idx = attn_metadata.prefill.pcp_metadata.q_tail_idx
@@ -489,17 +488,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         tail_attn_nomask_seqlens = attn_metadata.prefill.pcp_metadata.tail_attn_nomask_seqlens
         # Use ring_mla-specific mask (bfloat16, 512x512)
         # TODO: Remove this when mla_cp.py migrates to FIA
-        # ring_mla_mask = self._ring_mla_mask_builder.get_mla_mask(self.vllm_config.model_config.dtype)
-
-        # FIA with TND layout only supports bfloat16, convert if needed
-        original_dtype = q_nope.dtype
-        need_dtype_convert = original_dtype != torch.bfloat16
-        if need_dtype_convert:
-            q_nope = q_nope.to(torch.bfloat16)
-            q_pe = q_pe.to(torch.bfloat16)
-            k_nope = k_nope.to(torch.bfloat16)
-            k_pe = k_pe.to(torch.bfloat16)
-            value = value.to(torch.bfloat16)
+        ring_mla_mask = self._ring_mla_mask_builder.get_mla_mask(self.vllm_config.model_config.dtype)
 
         output_head, lse_head = self._attention_with_mask_and_nomask(
             q_nope=torch.index_select(q_nope, 0, q_head_idx),
@@ -511,7 +500,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             kv_nomask_idx=kv_with_q_head_nomask_idx,
             attn_mask_seqlens=attn_mask_seqlens,
             attn_nomask_seqlens=head_attn_nomask_seqlens,
-            mask=prefill_meta.attn_mask,
+            mask=ring_mla_mask,
         )
 
         output_tail, lse_tail = self._attention_with_mask_and_nomask(
@@ -524,50 +513,18 @@ class AscendMlaCPImpl(AscendMLAImpl):
             kv_nomask_idx=kv_with_q_tail_nomask_idx,
             attn_mask_seqlens=attn_mask_seqlens,
             attn_nomask_seqlens=tail_attn_nomask_seqlens,
-            mask=prefill_meta.attn_mask,
+            mask=ring_mla_mask,
         )
 
         q_full_idx = attn_metadata.prefill.pcp_metadata.q_full_idx
-        # attn_output = torch.index_select(torch.cat([output_head, output_tail], dim=0), 0, q_full_idx)
-        # attn_lse = torch.index_select(torch.cat([lse_head, lse_tail], dim=1), 1, q_full_idx)
-
-        # 1. 初始化全量结果容器
-        # num_tokens 是 q_nope.size(0)，即完整的 token 数
-        full_attn_output = torch.zeros(num_tokens, self.num_heads, self.v_head_dim, 
-                                     dtype=q_nope.dtype, device=q_nope.device)
-        # LSE 初始化为极小值
-        full_attn_lse = torch.full((self.num_heads, num_tokens), -float('inf'), 
-                                 dtype=torch.float32, device=q_nope.device)
-        print(f"DEBUG_SHAPE: out_prev {full_attn_output[q_head_idx].shape}") # 预期 [2, 8, 128]
-        print(f"DEBUG_SHAPE: lse_prev {full_attn_lse[:, q_head_idx].shape}") # 预期 [8, 2]
-        print(f"DEBUG_SHAPE: out_new {output_head.shape}")                  # 预期 [2, 8, 128]
-        res_out, res_lse = self._update_attn_with_lse(
-            full_attn_output[q_head_idx], full_attn_lse[:, q_head_idx], 
-            output_head, lse_head
-        )
-        full_attn_output[q_head_idx] = res_out
-        full_attn_lse[:, q_head_idx] = res_lse
-
-        # --- 第二次融合 tail ---
-        print(f"DEBUG_SHAPE: out_prev {full_attn_output[q_head_idx].shape}") # 预期 [2, 8, 128]
-        print(f"DEBUG_SHAPE: lse_prev {full_attn_lse[:, q_head_idx].shape}") # 预期 [8, 2]
-        print(f"DEBUG_SHAPE: out_new {output_head.shape}")    # 预期 [2, 8, 128]
-        res_out, res_lse = self._update_attn_with_lse( #有问题
-            full_attn_output[q_tail_idx], full_attn_lse[:, q_tail_idx], 
-            output_tail, lse_tail
-        )
-                     
-        full_attn_output[q_tail_idx] = res_out
-        full_attn_lse[:, q_tail_idx] = res_lse
+        attn_output = torch.index_select(torch.cat([output_head, output_tail], dim=0), 0, q_full_idx)
+        attn_lse = torch.index_select(torch.cat([lse_head, lse_tail], dim=1), 1, q_full_idx)
 
         output, _ = self._compute_prefill_context(
-            q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, full_attn_output, full_attn_lse
+            q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
         )
-        output = output.reshape([num_tokens, self.num_heads * self.v_head_dim])
 
-        # Convert back to original dtype if needed
-        if need_dtype_convert:
-            output = output.to(original_dtype)
+        output = output.reshape([num_tokens, self.num_heads * self.v_head_dim])
 
         return output
 
@@ -588,31 +545,29 @@ class AscendMlaCPImpl(AscendMLAImpl):
             q_nope.shape[0], self.num_heads, self.v_head_dim, dtype=k_pe.dtype, device=k_pe.device
         )
         attn_lse = torch.empty(self.num_heads, q_pe.shape[0], dtype=torch.float32, device=k_pe.device)
-
-        common_kwargs = {
-            "num_heads": self.num_heads,
-            "num_key_value_heads": self.num_heads,
-            "input_layout": "TND",
-            "scale": self.scale,
-            "softmax_lse_flag": True,
-        }
-
         # mask
         k_nope_mask = torch.index_select(k_nope, 0, kv_mask_idx)
         value_mask = torch.index_select(value, 0, kv_mask_idx)
         k_pe_mask = torch.index_select(k_pe, 0, kv_mask_idx)
-
-        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
-            q_nope, 
-            k_nope_mask, 
-            value_mask,
-            query_rope=q_pe, 
-            key_rope=k_pe_mask,
-            atten_mask=mask,
-            actual_seq_lengths=attn_mask_seqlens,
-            actual_seq_lengths_kv=attn_mask_seqlens,
-            sparse_mode=3,
-            **common_kwargs
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=k_nope_mask,
+            k_rope=k_pe_mask,
+            value=value_mask,
+            mask=mask,
+            seqlen=attn_mask_seqlens,
+            head_num=self.num_heads,
+            kv_head_num=self.num_heads,
+            pre_out=None,
+            prev_lse=None,
+            qk_scale=self.scale,
+            kernel_type="kernel_type_high_precision",
+            mask_type="mask_type_triu",
+            input_layout="type_bsnd",
+            calc_type="calc_type_first_ring",
+            output=attn_output,
+            softmax_lse=attn_lse,
         )
 
         # nomask
@@ -623,92 +578,27 @@ class AscendMlaCPImpl(AscendMLAImpl):
             k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx_split)
             value_nomask = torch.index_select(value, 0, kv_nomask_idx_split)
             k_pe_nomask = torch.index_select(k_pe, 0, kv_nomask_idx_split)
-
-            q_token_num = q_nope.size(0)
-            kv_seqlens_split = attn_nomask_seqlens_split.view(-1)
-            q_seqlens_fixed = torch.tensor([q_token_num], dtype=torch.int32, device=q_nope.device)
-
-            kv_seqlens_1d = attn_nomask_seqlens_split.flatten().to(torch.int32)
-
-            # 2. 修正 Q 长度：既然 q_nope.shape[0] 是 2，你需要告诉算子这 2 个 token 的分布。
-            # 如果这 2 个 token 属于 2 个不同的 batch：
-            batch_count = kv_seqlens_1d.size(0) # 对应 KV 的 batch 数，即 2
-            if q_token_num == batch_count:
-                # 比如 q_token_num 为 2, batch_count 为 2, 那么每个 batch 1 个 token, 累加就是 [1, 2]
-                q_seqlens_1d = torch.arange(1, batch_count + 1, dtype=torch.int32, device=q_nope.device)
-            else:
-                # 备选方案：如果 Q 只是当前的一个整体 segment
-                q_seqlens_1d = torch.tensor([q_token_num], dtype=torch.int32, device=q_nope.device)
-
-            # print("*"*100)
-            # print(f"kv_nomask_idx_split:{kv_nomask_idx_split},attn_nomask_seqlens_split:{attn_nomask_seqlens_split},kv_nomask_idx:{kv_nomask_idx},attn_nomask_seqlens:{attn_nomask_seqlens}")
-            # print(f"DEBUG: q_token_num:{q_token_num}, Q_rank: {q_seqlens_fixed}, KV_rank: {kv_seqlens_split}")
-            # # print("attn_nomask_seqlens_split",attn_nomask_seqlens_split)
-            # # print("q_nope",q_nope.shape)
-            # print(f"kv_seqlens_1d:{kv_seqlens_1d},batch_count:{batch_count},q_seqlens_1d:{q_seqlens_1d}")
-            # print("*"*100)
-
-            cur_out, cur_lse = torch_npu.npu_fused_infer_attention_score(
-                q_nope, 
-                k_nope_nomask, 
-                value_nomask,
-                query_rope=q_pe, 
-                key_rope=k_pe_nomask,
-                atten_mask=None,
-                actual_seq_lengths=q_seqlens_1d,
-                actual_seq_lengths_kv=kv_seqlens_1d,
-                sparse_mode=0,
-                **common_kwargs
+            torch_npu.atb.npu_ring_mla(
+                q_nope=q_nope,
+                q_rope=q_pe,
+                k_nope=k_nope_nomask,
+                k_rope=k_pe_nomask,
+                value=value_nomask,
+                mask=mask,
+                seqlen=attn_nomask_seqlens_split,
+                head_num=self.num_heads,
+                kv_head_num=self.num_heads,
+                pre_out=attn_output,
+                prev_lse=attn_lse,
+                qk_scale=self.scale,
+                kernel_type="kernel_type_high_precision",
+                mask_type="no_mask",
+                input_layout="type_bsnd",
+                calc_type="calc_type_default",
+                output=attn_output,
+                softmax_lse=attn_lse,
             )
-
-            attn_output, attn_lse = self._update_attn_with_lse(
-                attn_output, attn_lse, cur_out, cur_lse
-            )
-
-            # 强行校准 NPU 算子输出异常
-            if attn_output.dim() == 4: #有问题
-                # 如果多出来的维度在最前面且大小等于 head 数
-                if attn_output.size(0) == self.num_heads:
-                    attn_output = attn_output[0] 
-                else:
-                    # 如果是 [1, T, H, D] 这种
-                    attn_output = attn_output.squeeze(0)
-                    
-            if attn_lse.dim() == 3:
-                if attn_lse.size(0) == self.num_heads:
-                    attn_lse = attn_lse[0]
-                else:
-                    attn_lse = attn_lse.squeeze(0)
-
         return attn_output, attn_lse
-
-    def _update_attn_with_lse(self, out_prev, lse_prev, out_new, lse_new):
-        """
-        out_prev/new: [T, H, D]
-        lse_prev/new: [H, T]
-        """
-        # 检查输入，如果是 4 维先压平
-        if out_new.dim() == 4:
-            out_new = out_new.view(out_new.size(1), self.num_heads, -1)
-
-        # lse_prev/new shape: [heads, tokens] -> 转置对齐: [tokens, heads, 1]
-        lse_p = lse_prev.transpose(0, 1).unsqueeze(-1)
-        lse_n = lse_new.transpose(0, 1).unsqueeze(-1)
-
-        # 找到最大 LSE 以防止溢出
-        lse_max = torch.maximum(lse_p, lse_n)
-        
-        # 计算权重因子
-        w_p = torch.exp(lse_p - lse_max)
-        w_n = torch.exp(lse_n - lse_max)
-        
-        # 融合 Output
-        out_combined = (out_prev * w_p + out_new * w_n) / (w_p + w_n)
-        
-        # 融合 LSE: log(exp(lse_p) + exp(lse_n))
-        lse_combined = lse_max + torch.log(w_p + w_n)
-
-        return out_combined, lse_combined.squeeze(-1).transpose(0, 1)
 
     def _forward_decode(
         self,
