@@ -459,9 +459,9 @@ class PCPManager:
                 # draft_len of each request [1, 2, 1]
                 # then prev_draft_token_indices is [0,   2, 3,   4]
                 prev_draft_token_indices.extend(range(start, start + draft_len))
-        num_commmon_tokens = len(sample_flattened_indices)
+        num_common_tokens = len(sample_flattened_indices)
 
-        if num_commmon_tokens == 0:
+        if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
             return
@@ -678,25 +678,13 @@ class PCPManager:
                     tensor_npu = self._list_to_tensor(value, self.device)
                     self.kv_idx_names[key] = tensor_npu
 
-                attn_mask_seqlens = torch.tensor([chunk_seqlens, chunk_seqlens], dtype=torch.int32)
-                head_attn_nomask_seqlens = torch.tensor(
-                    [chunk_seqlens, kv_with_q_head_nomask_seqlens], dtype=torch.int32
-                )
-                tail_attn_nomask_seqlens = torch.tensor(
-                    [chunk_seqlens, kv_with_q_tail_nomask_seqlens], dtype=torch.int32
-                )
-                if self.vllm_config.model_config.use_mla:
-                    (
-                        split_q_head_nomask_idx_tensor_list,
-                        split_q_tail_nomask_idx_tensor_list,
-                        head_attn_nomask_seqlens_list,
-                        tail_attn_nomask_seqlens_list,
-                    ) = self._split_nomask_idx_tensor_list(
-                        split_with_q_head_nomask_idx_reqs,
-                        split_kv_with_q_tail_nomask_idx_reqs,
-                        head_attn_nomask_seqlens,
-                        chunk_seqlens,
-                    )
+                attn_mask_seqlens = torch.cumsum(torch.tensor(chunk_seqlens, dtype=torch.int32), dim=0).tolist()
+                head_attn_nomask_seqlens = torch.cumsum(
+                    torch.tensor(kv_with_q_head_nomask_seqlens, dtype=torch.int32), dim=0
+                ).tolist()
+                tail_attn_nomask_seqlens = torch.cumsum(
+                    torch.tensor(kv_with_q_tail_nomask_seqlens, dtype=torch.int32), dim=0
+                ).tolist()
 
                 self.extra_long_seq_kwargs = {
                     "attn_mask_seqlens": attn_mask_seqlens,
@@ -720,11 +708,6 @@ class PCPManager:
                 long_seq_metadata.attn_mask_seqlens = self.extra_long_seq_kwargs["attn_mask_seqlens"]
                 long_seq_metadata.head_attn_nomask_seqlens = self.extra_long_seq_kwargs["head_attn_nomask_seqlens"]
                 long_seq_metadata.tail_attn_nomask_seqlens = self.extra_long_seq_kwargs["tail_attn_nomask_seqlens"]
-                if self.vllm_config.model_config.use_mla:
-                    long_seq_metadata.kv_with_q_head_nomask_idx_tensor = split_q_head_nomask_idx_tensor_list
-                    long_seq_metadata.kv_with_q_tail_nomask_idx_tensor = split_q_tail_nomask_idx_tensor_list
-                    long_seq_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens_list
-                    long_seq_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens_list
 
         self.long_seq_metadata = long_seq_metadata
         return long_seq_metadata, block_table_tensor
