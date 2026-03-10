@@ -1283,7 +1283,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Input shape: [num_tokens, num_heads, dim]
             q_nope = q_nope.view(num_tokens, self.num_heads, -1).contiguous()
             q_pe = q_pe.view(num_tokens, self.num_heads, -1)
-
             if padding_value > 0:
                 q_pe = F.pad(q_pe, (0, 0, 0, padding_value), "constant", 0)
                 q_nope = F.pad(q_nope, (0, 0, 0, padding_value), "constant", 0)
@@ -1301,6 +1300,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 input_layout = "BSND_NBSD"
                 q_nope = q_nope.view(num_tokens, 1, self.num_heads, -1).contiguous()
                 q_pe = q_pe.view(num_tokens, 1, self.num_heads, -1)
+                if padding_value > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, padding_value), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, padding_value), "constant", 0)
             else:
                 # Input shape: [num_tokens, num_heads, seq_len, dim]
                 input_layout = "BNSD_NBSD"
