@@ -708,7 +708,7 @@ class PCPManager:
             #In long-sequence scenarios, the computational cost and latency
             #of the _npu_ring_mla operator are not proportional, so we split
             #long sequences into shorter ones to improve performance.
-            split_size = 16 * 1024
+            split_size = 8192
             if self.pcp_world_rank == 0:
                 split_q_head_nomask_idx_list = [
                     self.kv_idx_names['kv_with_q_head_nomask_idx_tensor']
