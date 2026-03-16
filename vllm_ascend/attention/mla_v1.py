@@ -1047,13 +1047,35 @@ class AscendMLAImpl(MLAAttentionImpl):
 
             actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
 
-            query = torch.cat((q_nope, q_pe), dim=-1)
-            key = torch.cat((k_nope, k_pe), dim=-1)
+            check_num_heads_is_power_of_two = self.check_num_heads(self.num_heads)
 
-            chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
-                query,
-                key,
+            if check_num_heads_is_power_of_two is False:
+                query = torch.cat((q_nope, q_pe), dim=-1)
+                key = torch.cat((k_nope, k_pe), dim=-1)
+
+                chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
+                    query,
+                    key,
+                    v,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_heads,
+                    input_layout="TND",
+                    atten_mask=None,
+                    sparse_mode=0,
+                    scale=self.scale,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    softmax_lse_flag=True,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                )
+            else:
+                chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
+                q_nope,
+                k_nope,
                 v,
+                query_rope=q_pe,
+                key_rope=k_pe,
                 num_heads=self.num_heads,
                 num_key_value_heads=self.num_heads,
                 input_layout="TND",
@@ -1065,7 +1087,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 softmax_lse_flag=True,
                 actual_seq_lengths=actual_seq_lengths_q,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
-            )
+                )
             chunk_outputs.append(chunk_out)
             chunk_lses.append(chunk_lse)
 
@@ -1102,6 +1124,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             return output_final.view(num_tokens, H, D), None
 
         return prefix_output, prefix_lse
+    
+    def check_num_heads(self, num_heads):
+        # Check if num_heads is a power of two
+        if num_heads > 0 and (num_heads & (num_heads - 1)) == 0:
+            return True
+        return False
 
     def _forward_prefill(
         self,
@@ -1138,23 +1166,48 @@ class AscendMLAImpl(MLAAttentionImpl):
         query = torch.cat((q_nope, q_pe), dim=-1)
         key = torch.cat((k_nope, k_pe), dim=-1)
 
-        common_kwargs = {
-            "num_heads": self.num_heads,
-            "num_key_value_heads": self.num_heads,
-            "input_layout": "TND",
-            "atten_mask": prefill_meta.attn_mask,
-            "sparse_mode": 3,
-            "scale": self.scale,
-            "antiquant_mode": 0,
-            "antiquant_scale": None,
-            "block_table": None,
-            "block_size": 0,
-            "softmax_lse_flag": True,
-            "actual_seq_lengths": actual_seq_lengths_q,
-            "actual_seq_lengths_kv": actual_seq_lengths_kv,
-        }
+        check_num_heads_is_power_of_two = self.check_num_heads(self.num_heads)
 
-        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(query, key, value, **common_kwargs)
+        if check_num_heads_is_power_of_two is False:
+            query = torch.cat((q_nope, q_pe), dim=-1)
+            key = torch.cat((k_nope, k_pe), dim=-1)
+            common_kwargs = {
+                "num_heads": self.num_heads,
+                "num_key_value_heads": self.num_heads,
+                "input_layout": "TND",
+                "atten_mask": prefill_meta.attn_mask,
+                "sparse_mode": 3,
+                "scale": self.scale,
+                "antiquant_mode": 0,
+                "antiquant_scale": None,
+                "block_table": None,
+                "block_size": 0,
+                "softmax_lse_flag": True,
+                "actual_seq_lengths": actual_seq_lengths_q,
+                "actual_seq_lengths_kv": actual_seq_lengths_kv,
+            }
+            attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(query, key, value, **common_kwargs)
+        
+        else:
+            common_kwargs = {
+                'query_rope': q_pe,
+                'key_rope': k_pe,
+                'num_heads': self.num_heads,
+                'num_key_value_heads': self.num_kv_heads,
+                'input_layout': 'TND',
+                'atten_mask': prefill_meta.attn_mask,
+                'sparse_mode': 3,
+                'scale': self.scale,
+                'antiquant_mode': 0,
+                'antiquant_scale': None,
+                'block_table': None,
+                'block_size': 0,
+                'softmax_lse_flag': True,
+                "actual_seq_lengths": actual_seq_lengths_q,
+                "actual_seq_lengths_kv": actual_seq_lengths_kv,
+            }
+            attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
+                q_nope, k_nope, value, **common_kwargs)
 
         attn_output, attn_lse = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
