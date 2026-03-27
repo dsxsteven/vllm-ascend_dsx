@@ -560,6 +560,11 @@ class AscendMlaCPImpl(AscendMLAImpl):
         mask: torch.Tensor,
         attn_metadata,
     ):
+        attn_out_mask = torch.empty(
+            q_nope.shape[0], self.num_heads, self.v_head_dim, dtype=k_pe.dtype, device=k_pe.device
+        )
+        attn_lse_mask = torch.empty(self.num_heads, q_pe.shape[0], dtype=torch.float32, device=k_pe.device)
+
         # nomask Attention
         if kv_nomask_idx is not None and kv_nomask_idx.numel() > 0:
             k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx)
