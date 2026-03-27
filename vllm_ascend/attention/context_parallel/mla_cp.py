@@ -554,8 +554,8 @@ class AscendMlaCPImpl(AscendMLAImpl):
         value: torch.Tensor,
         kv_mask_idx: torch.Tensor,
         kv_nomask_idx: torch.Tensor,
-        attn_mask_seqlens: torch.Tensor,
-        attn_nomask_seqlens: torch.Tensor,
+        attn_mask_seqlens: list[int],
+        attn_nomask_seqlens: list[int],
         mask: torch.Tensor,
         attn_metadata,
     ):
