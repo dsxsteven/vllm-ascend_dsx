@@ -28,7 +28,13 @@ from vllm_ascend.attention.mla_v1 import (
     BUILD_METADATA_STEP_PREFILL,
 )
 # isort: on
-
+from vllm_ascend.attention.context_parallel.common_cp import (
+    AscendMetadataForDecode,
+    AscendMetadataForPrefill,
+    AscendPCPMetadata,
+    _npu_attention_update,
+    _process_attn_out_lse,
+)
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import (
@@ -40,11 +46,14 @@ from vllm_ascend.attention.context_parallel.common_cp import (
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params, update_graph_params_workspaces
 from vllm_ascend.utils import weak_ref_tensors
-
+import logging
+import torch
 MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 
 M = TypeVar("M", bound=AscendMLAMetadata)
-
+# 配置 Logger 格式
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("CP_DEBUG")
 
 class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
     """
@@ -465,6 +474,24 @@ class AscendMlaCPImpl(AscendMLAImpl):
             decode_q_nope, decode_q_pe = decode_q_no_split.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return decode_q_nope, decode_q_pe
 
+
+
+    def log_tensor_stats(self,name, tensor):
+        import logging
+        if tensor is None:
+            logger.warning(f"{name} is None")
+        
+        # 确保在 CPU 上计算统计信息，避免 NPU/GPU 异步打印干扰
+        else:
+            t = tensor.detach().float().cpu()
+            logging.warning(
+                f"DEBUG: {name},"
+                f"Shape: {list(t.shape)}, "
+                f"Max: {t.max().item():.6f}, "
+                f"Mean: {t.mean().item():.6f}, "
+                f"Sum: {t.sum().item():.2f}"
+            )
+
     def _forward_prefill(
         self,
         q_nope: torch.Tensor,
@@ -490,11 +517,30 @@ class AscendMlaCPImpl(AscendMLAImpl):
         attn_mask_seqlens = attn_metadata.prefill.pcp_metadata.attn_mask_seqlens
         head_attn_nomask_seqlens = attn_metadata.prefill.pcp_metadata.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = attn_metadata.prefill.pcp_metadata.tail_attn_nomask_seqlens
+
+        attn_mask_seqlens_fia = torch.cumsum(attn_mask_seqlens[0], dim=0).tolist()
+        head_attn_nomask_seqlens_fia = torch.cumsum(head_attn_nomask_seqlens[1], dim=0).tolist()
+        tail_attn_nomask_seqlens_fia = torch.cumsum(tail_attn_nomask_seqlens[1], dim=0).tolist()
         # Use ring_mla-specific mask (bfloat16, 512x512)
         # TODO: Remove this when mla_cp.py migrates to FIA
         ring_mla_mask = self._ring_mla_mask_builder.get_mla_mask(self.vllm_config.model_config.dtype)
+        prefill_meta = attn_metadata.prefill
 
-        output_head, lse_head = self._attention_with_mask_and_nomask(
+        output_head_fia, lse_head_fia = self._attention_with_mask_and_nomask(
+            q_nope=torch.index_select(q_nope, 0, q_head_idx),
+            q_pe=torch.index_select(q_pe, 0, q_head_idx),
+            k_nope=k_nope,
+            k_pe=k_pe,
+            value=value,
+            kv_mask_idx=kv_with_q_head_mask_idx,
+            kv_nomask_idx=kv_with_q_head_nomask_idx,
+            attn_mask_seqlens=attn_mask_seqlens_fia,
+            attn_nomask_seqlens=head_attn_nomask_seqlens_fia,
+            mask=prefill_meta.attn_mask,
+            attn_metadata=attn_metadata,
+        )
+
+        output_head_ring, lse_head_ring = self._attention_with_mask_and_nomask_ring(
             q_nope=torch.index_select(q_nope, 0, q_head_idx),
             q_pe=torch.index_select(q_pe, 0, q_head_idx),
             k_nope=k_nope,
@@ -507,7 +553,21 @@ class AscendMlaCPImpl(AscendMLAImpl):
             mask=ring_mla_mask,
         )
 
-        output_tail, lse_tail = self._attention_with_mask_and_nomask(
+        output_tail_fia, lse_tail_fia = self._attention_with_mask_and_nomask(
+            q_nope=torch.index_select(q_nope, 0, q_tail_idx),
+            q_pe=torch.index_select(q_pe, 0, q_tail_idx),
+            k_nope=k_nope,
+            k_pe=k_pe,
+            value=value,
+            kv_mask_idx=kv_with_q_tail_mask_idx,
+            kv_nomask_idx=kv_with_q_tail_nomask_idx,
+            attn_mask_seqlens=attn_mask_seqlens_fia,
+            attn_nomask_seqlens=tail_attn_nomask_seqlens_fia,
+            mask=prefill_meta.attn_mask,
+            attn_metadata=attn_metadata,
+        )
+
+        output_tail_ring, lse_tail_ring = self._attention_with_mask_and_nomask_ring(
             q_nope=torch.index_select(q_nope, 0, q_tail_idx),
             q_pe=torch.index_select(q_pe, 0, q_tail_idx),
             k_nope=k_nope,
@@ -520,9 +580,28 @@ class AscendMlaCPImpl(AscendMLAImpl):
             mask=ring_mla_mask,
         )
 
+        # output_tail, lse_tail = output_tail_ring, lse_tail_ring
+        output_head, lse_head = output_head_fia, lse_head_fia
+        # self.log_tensor_stats("output_tail_ring", output_tail_ring)
+        # self.log_tensor_stats("lse_tail_ring", lse_tail_ring)
+
+        # output_head, lse_head = output_head_ring, lse_head_ring
+        output_tail, lse_tail = output_tail_fia, lse_tail_fia
+        # output_tail_ring, lse_tail_ring
+        # output_tail_fia,lse_tail_fia
+
+        # 打印 FIA 相关的统计信息
+        # self.log_tensor_stats("output_tail_fia", output_tail_fia)
+        # self.log_tensor_stats("lse_tail_fia", lse_tail_fia)
+        # logger.info(f'>>>>>> end')
+
         q_full_idx = attn_metadata.prefill.pcp_metadata.q_full_idx
         attn_output = torch.index_select(torch.cat([output_head, output_tail], dim=0), 0, q_full_idx)
-        attn_lse = torch.index_select(torch.cat([lse_head, lse_tail], dim=1), 1, q_full_idx)
+        # attn_lse = torch.index_select(torch.cat([lse_head, lse_tail], dim=1), 1, q_full_idx)
+        attn_lse = None
+        if attn_metadata.prefill is not None and attn_metadata.prefill.chunked_context is not None:
+            logger.info(f'>>>>>>>>>> should not get heeheheheh')
+            attn_lse = torch.index_select(torch.cat([lse_head, lse_tail], dim=0), 0, q_full_idx)
 
         output, _ = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
@@ -531,7 +610,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
         output = output.reshape([num_tokens, self.num_heads * self.v_head_dim])
 
         return output
-
+    
     def _attention_with_mask_and_nomask(
         self,
         q_nope: torch.Tensor,
@@ -540,11 +619,118 @@ class AscendMlaCPImpl(AscendMLAImpl):
         k_pe: torch.Tensor,
         value: torch.Tensor,
         kv_mask_idx: torch.Tensor,
-        kv_nomask_idx: list[torch.Tensor],
-        attn_mask_seqlens: torch.Tensor,
-        attn_nomask_seqlens: list[torch.Tensor],
+        kv_nomask_idx: torch.Tensor,
+        attn_mask_seqlens: list[int],
+        attn_nomask_seqlens: list[int],
         mask: torch.Tensor,
+        attn_metadata,
     ):
+        # nomask Attention
+        if kv_nomask_idx is not None and kv_nomask_idx.numel() > 0:
+            k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx)
+            value_nomask = torch.index_select(value, 0, kv_nomask_idx)
+            k_pe_nomask = torch.index_select(k_pe, 0, kv_nomask_idx)
+
+            attn_out_nomask, attn_lse_nomask = torch.ops.npu.npu_fused_infer_attention_score(
+                q_nope,
+                k_nope_nomask,
+                value_nomask,
+                query_rope=q_pe,
+                key_rope=k_pe_nomask,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_heads,
+                input_layout="TND",
+                atten_mask=None,
+                scale=self.scale,
+                sparse_mode=0,
+                antiquant_mode=0,
+                antiquant_scale=None,
+                softmax_lse_flag=True,
+                actual_seq_lengths_kv=attn_nomask_seqlens,
+                actual_seq_lengths=attn_mask_seqlens,
+                )
+
+        # mask Attention
+        k_nope_mask = torch.index_select(k_nope, 0, kv_mask_idx)
+        value_mask = torch.index_select(value, 0, kv_mask_idx)
+        k_pe_mask = torch.index_select(k_pe, 0, kv_mask_idx)
+
+        attn_out_mask, attn_lse_mask = torch.ops.npu.npu_fused_infer_attention_score(
+            q_nope,
+            k_nope_mask,
+            value_mask,
+            query_rope=q_pe,
+            key_rope=k_pe_mask,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_heads,
+            input_layout="TND",
+            atten_mask=mask,
+            scale=self.scale,
+            sparse_mode=3,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            softmax_lse_flag=True,
+            actual_seq_lengths_kv=attn_mask_seqlens,
+            actual_seq_lengths=attn_mask_seqlens,
+        )
+
+        # update
+        output = attn_out_mask
+        attn_lse = attn_lse_mask
+
+        if kv_nomask_idx is not None and kv_nomask_idx.numel() > 0:
+            if attn_metadata.prefill is not None and attn_metadata.prefill.chunked_context is None:
+                output = self._npu_attn_out_lse_update(attn_lse_mask, attn_lse_nomask, attn_out_mask, attn_out_nomask)
+                attn_lse = None
+            else:
+                output, attn_lse = self._update_out_and_lse(
+                    torch.stack([attn_out_nomask, attn_out_mask], dim=0),
+                    torch.stack([attn_lse_nomask, attn_lse_mask], dim=0),
+                )
+
+        return output, attn_lse
+    
+    def _update_out_and_lse(self, out_list: torch.Tensor, lse_list: torch.Tensor) -> torch.Tensor:
+        """LSE_final = log(sum(exp(LSE_i))), O_final = sum(exp(LSE_i - LSE_final) * O_i)
+        Args:
+            out_list: shape = [N, batch_size, num_heads, head_size]
+            lse_list: shape = [N, batch_size, num_heads, 1]
+        Returns:
+            out_final: shape = [batch_size, num_heads, head_size]
+            lse_final: shape = [batch_size, num_heads, 1]
+        """
+        lse_final = torch.logsumexp(lse_list, dim=0, keepdim=False)
+        out_final = torch.sum(torch.exp(lse_list - lse_final) * out_list, dim=0)
+        return out_final, lse_final
+    
+    def _npu_attn_out_lse_update(self, attn_lse_mask, attn_lse_nomask, attn_out_mask, attn_out_nomask):
+        T = attn_out_mask.shape[0]
+        N = attn_out_mask.shape[1]
+        D = attn_out_mask.shape[2]
+        attn_out_mask, attn_lse_mask = self._out_lse_reshape(attn_out_mask, attn_lse_mask)
+        attn_out_nomask, attn_lse_nomask = self._out_lse_reshape(attn_out_nomask, attn_lse_nomask)
+        attn_out_mask = attn_out_mask.to(torch.float32)
+        attn_out_nomask = attn_out_nomask.to(torch.float32)
+        attn_lse_mask = attn_lse_mask.to(torch.float32)
+        attn_lse_nomask = attn_lse_nomask.to(torch.float32)
+        attn_output = [attn_out_nomask, attn_out_mask]
+        attn_lse = [attn_lse_nomask, attn_lse_mask]
+        update_type = 0
+        output, _ = torch_npu.npu_attention_update(attn_lse, attn_output, update_type)
+        output = output.view(T, N, D)
+        return output
+
+    def _out_lse_reshape(self, attn_out: torch.Tensor, attn_lse: torch.Tensor) -> torch.Tensor:
+        attn_out = attn_out.contiguous().view(attn_out.shape[0] * attn_out.shape[1], attn_out.shape[2])
+        attn_lse = attn_lse.contiguous().view(attn_lse.shape[0] * attn_lse.shape[1] * attn_lse.shape[2])
+        return attn_out, attn_lse
+
+    def _attention_with_mask_and_nomask_ring(
+        self, q_nope: torch.Tensor, q_pe: torch.Tensor,
+            k_nope: torch.Tensor, k_pe: torch.Tensor, value: torch.Tensor,
+            kv_mask_idx: torch.Tensor, kv_nomask_idx: torch.Tensor,
+            attn_mask_seqlens: torch.Tensor, attn_nomask_seqlens: torch.Tensor,
+            mask: torch.Tensor):
         attn_output = torch.empty(
             q_nope.shape[0], self.num_heads, self.v_head_dim, dtype=k_pe.dtype, device=k_pe.device
         )
@@ -575,33 +761,30 @@ class AscendMlaCPImpl(AscendMLAImpl):
         )
 
         # nomask
-        if not kv_nomask_idx or len(kv_nomask_idx[0]) == 0:
+        if kv_nomask_idx.shape[0] == 0:
             return attn_output, attn_lse
 
-        for kv_nomask_idx_split, attn_nomask_seqlens_split in zip(kv_nomask_idx, attn_nomask_seqlens):
-            k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx_split)
-            value_nomask = torch.index_select(value, 0, kv_nomask_idx_split)
-            k_pe_nomask = torch.index_select(k_pe, 0, kv_nomask_idx_split)
-            torch_npu.atb.npu_ring_mla(
-                q_nope=q_nope,
-                q_rope=q_pe,
-                k_nope=k_nope_nomask,
-                k_rope=k_pe_nomask,
-                value=value_nomask,
-                mask=mask,
-                seqlen=attn_nomask_seqlens_split,
-                head_num=self.num_heads,
-                kv_head_num=self.num_heads,
-                pre_out=attn_output,
-                prev_lse=attn_lse,
-                qk_scale=self.scale,
-                kernel_type="kernel_type_high_precision",
-                mask_type="no_mask",
-                input_layout="type_bsnd",
-                calc_type="calc_type_default",
-                output=attn_output,
-                softmax_lse=attn_lse,
-            )
+        k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx)
+        value_nomask = torch.index_select(value, 0, kv_nomask_idx)
+        k_pe_nomask = torch.index_select(k_pe, 0, kv_nomask_idx)
+        torch_npu.atb.npu_ring_mla(q_nope=q_nope,
+                                   q_rope=q_pe,
+                                   k_nope=k_nope_nomask,
+                                   k_rope=k_pe_nomask,
+                                   value=value_nomask,
+                                   mask=mask,
+                                   seqlen=attn_nomask_seqlens,
+                                   head_num=self.num_heads,
+                                   kv_head_num=self.num_heads,
+                                   pre_out=attn_output,
+                                   prev_lse=attn_lse,
+                                   qk_scale=self.scale,
+                                   kernel_type="kernel_type_high_precision",
+                                   mask_type="no_mask",
+                                   input_layout="type_bsnd",
+                                   calc_type="calc_type_default",
+                                   output=attn_output,
+                                   softmax_lse=attn_lse)
         return attn_output, attn_lse
 
     def _forward_decode(
