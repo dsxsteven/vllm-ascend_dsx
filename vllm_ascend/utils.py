@@ -1177,6 +1177,7 @@ def enable_dsa_cp() -> bool:
 def enable_dsa_cp_with_layer_shard() -> bool:
     if not enable_dsa_cp():
         return False
+    # return True
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
@@ -1190,6 +1191,7 @@ def enable_dsa_cp_with_layer_shard() -> bool:
 def enable_dsa_cp_with_o_proj_tp() -> bool:
     if not enable_dsa_cp():
         return False
+    # return False
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
