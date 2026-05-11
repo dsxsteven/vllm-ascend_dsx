@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, NamedTuple, TypeVar, Optional
 
 import numpy as np
 import torch
@@ -61,6 +61,7 @@ from vllm_ascend.utils import (
     weak_ref_tensors,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1186,24 +1187,48 @@ class AscendMLAImpl(MLAAttentionImpl):
 
             actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
 
-            chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
-                q_nope,
-                k_nope,
-                v,
-                query_rope=q_pe,
-                key_rope=k_pe,
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_heads,
-                input_layout="TND",
-                atten_mask=None,
-                sparse_mode=0,
-                scale=self.scale,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                softmax_lse_flag=True,
-                actual_seq_lengths=actual_seq_lengths_q,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-            )
+            check_num_heads_is_power_of_two = self.check_num_heads(self.num_heads)
+
+            if check_num_heads_is_power_of_two is False:
+                query = torch.cat((q_nope, q_pe), dim=-1)
+                key = torch.cat((k_nope, k_pe), dim=-1)
+
+                chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
+                    query,
+                    key,
+                    v,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_heads,
+                    input_layout="TND",
+                    atten_mask=None,
+                    sparse_mode=0,
+                    scale=self.scale,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    softmax_lse_flag=True,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                )
+
+            else:
+                chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
+                    q_nope,
+                    k_nope,
+                    v,
+                    query_rope=q_pe,
+                    key_rope=k_pe,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_heads,
+                    input_layout="TND",
+                    atten_mask=None,
+                    sparse_mode=0,
+                    scale=self.scale,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    softmax_lse_flag=True,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                )
             if chunk_lse.dim() == 2:
                 chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
             chunk_out = chunk_out.to(torch.float32)
@@ -1213,6 +1238,12 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         output_final, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
         return output_final.view(num_tokens, H, D), None
+
+    def check_num_heads(self, num_heads):
+        # Check if num_heads is a power of two
+        if num_heads > 0 and (num_heads & (num_heads - 1)) == 0:
+            return True
+        return False
 
     def _forward_prefill(
         self,
@@ -1245,25 +1276,48 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_output = torch.empty(num_tokens, self.num_heads, self.v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
         attn_lse = torch.empty(self.num_heads, num_tokens, dtype=torch.float32, device=q_nope.device)
 
-        common_kwargs = {
-            "query_rope": q_pe,
-            "key_rope": k_pe,
-            "num_heads": self.num_heads,
-            "num_key_value_heads": self.num_heads,
-            "input_layout": "TND",
-            "atten_mask": prefill_meta.attn_mask,
-            "sparse_mode": 3,
-            "scale": self.scale,
-            "antiquant_mode": 0,
-            "antiquant_scale": None,
-            "block_table": None,
-            "block_size": 0,
-            "softmax_lse_flag": True,
-            "actual_seq_lengths": actual_seq_lengths_q,
-            "actual_seq_lengths_kv": actual_seq_lengths_kv,
-        }
+        check_num_heads_is_power_of_two = self.check_num_heads(self.num_heads)
 
-        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, value, **common_kwargs)
+        if check_num_heads_is_power_of_two is False:
+            query = torch.cat((q_nope, q_pe), dim=-1)
+            key = torch.cat((k_nope, k_pe), dim=-1)
+            common_kwargs = {
+                "num_heads": self.num_heads,
+                "num_key_value_heads": self.num_heads,
+                "input_layout": "TND",
+                "atten_mask": prefill_meta.attn_mask,
+                "sparse_mode": 3,
+                "scale": self.scale,
+                "antiquant_mode": 0,
+                "antiquant_scale": None,
+                "block_table": None,
+                "block_size": 0,
+                "softmax_lse_flag": True,
+                "actual_seq_lengths": actual_seq_lengths_q,
+                "actual_seq_lengths_kv": actual_seq_lengths_kv,
+            }
+            attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(query, key, value, **common_kwargs)
+        
+        else:
+            common_kwargs = {
+                'query_rope': q_pe,
+                'key_rope': k_pe,
+                'num_heads': self.num_heads,
+                'num_key_value_heads': self.num_kv_heads,
+                'input_layout': 'TND',
+                'atten_mask': prefill_meta.attn_mask,
+                'sparse_mode': 3,
+                'scale': self.scale,
+                'antiquant_mode': 0,
+                'antiquant_scale': None,
+                'block_table': None,
+                'block_size': 0,
+                'softmax_lse_flag': True,
+                "actual_seq_lengths": actual_seq_lengths_q,
+                "actual_seq_lengths_kv": actual_seq_lengths_kv,
+            }
+            attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
+                q_nope, k_nope, value, **common_kwargs)
 
         attn_output, attn_lse = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
@@ -1383,6 +1437,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             k_pe = k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
 
         attn_output_shape: tuple | None = None
+        self.num_heads_padded = 1 << (self.num_heads - 1).bit_length()
+        padding_value = self.num_heads_padded - self.num_heads
+        actual_num_heads = self.num_heads_padded if padding_value > 0 else self.num_heads
         if (
             attn_metadata.attn_state
             in [
@@ -1401,8 +1458,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Input shape: [num_tokens, num_heads, dim]
             q_nope = q_nope.view(num_tokens, self.num_heads, -1).contiguous()
             q_pe = q_pe.view(num_tokens, self.num_heads, -1)
+            if padding_value > 0:
+                q_pe = F.pad(q_pe, (0, 0, 0, padding_value), "constant", 0)
+                q_nope = F.pad(q_nope, (0, 0, 0, padding_value), "constant", 0)
             # Output shape: [num_heads, num_tokens, dim]
-            attn_output_shape = (self.num_heads, num_tokens, self.kv_lora_rank)
+            attn_output_shape = (actual_num_heads, num_tokens, self.kv_lora_rank)
             sparse_mode = 3
             attn_mask = attn_metadata.decode.attn_mask  # type:ignore
             actual_seq_lengths = decode_meta.actual_seq_lengths_q
@@ -1413,10 +1473,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             input_layout = "BSND_NBSD"
             q_nope = q_nope.view(num_tokens, 1, self.num_heads, -1).contiguous()
             q_pe = q_pe.view(num_tokens, 1, self.num_heads, -1).contiguous()
+            if padding_value > 0:
+                q_pe = F.pad(q_pe, (0, 0, 0, padding_value), "constant", 0)
+                q_nope = F.pad(q_nope, (0, 0, 0, padding_value), "constant", 0)
             dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, 1, self.num_heads)
             sparse_mode = 0
             actual_seq_lengths = None
-            attn_output_shape = (self.num_heads, num_tokens, 1, self.kv_lora_rank)
+            attn_output_shape = (actual_num_heads, num_tokens, 1, self.kv_lora_rank)
         else:
             # The output layout is set to NBSD to eliminate the need for a
             # transpose operation after attention.
@@ -1430,6 +1493,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 input_layout = "BNSD_NBSD"
                 q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
+                if padding_value > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, padding_value), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, padding_value), "constant", 0)
             # Output shape: [num_heads, num_tokens, seq_len, dim]
             attn_output_shape = (self.num_heads, num_tokens, 1, self.kv_lora_rank)
             sparse_mode = 0
@@ -1438,7 +1504,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         common_kwargs = {
             "query_rope": q_pe,
             "key_rope": k_pe,
-            "num_query_heads": self.num_heads,
+            "num_heads": actual_num_heads,
             "num_key_value_heads": self.num_kv_heads,
             "input_layout": input_layout,
             "atten_mask": attn_mask,
