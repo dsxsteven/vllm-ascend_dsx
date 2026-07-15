@@ -32,6 +32,11 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInp
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
+from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
+    estimate_moe_ffn_num_chunks,
+    run_moe_ffn_in_token_chunks,
+    supports_moe_ffn_chunking,
+)
 from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
@@ -104,6 +109,13 @@ class MoECommMethod(ABC):
         self.prepare_finalize.set_lora_context(lora_context)
         self.token_dispatcher.set_lora_context(lora_context)
 
+        ascend_config = get_ascend_config()
+        self.enable_ffn_chunking = getattr(ascend_config, "enable_ffn_chunking", False) is True
+        if self.enable_ffn_chunking:
+            self.ffn_chunk_live_factor = ascend_config.ffn_chunk_live_factor
+            self.ffn_chunk_target_hidden_factor = ascend_config.ffn_chunk_target_hidden_factor
+            self.ffn_min_chunk_size = ascend_config.ffn_min_chunk_size
+
     def prepare(
         self,
         hidden_states: torch.Tensor,
@@ -157,7 +169,9 @@ class MoECommMethod(ABC):
             token_dispatch_output=token_dispatch_output,
             moe_config=self.moe_config,
         )
-        if quant_method is None:
+        if self.enable_ffn_chunking:
+            mlp_output, before_gmm2_evt = self._apply_mlp_with_optional_chunking(mlp_compute_input, quant_method)
+        elif quant_method is None:
             # Legacy path (310P): the comm method overrides ``_apply_mlp`` with
             # its own MLP implementation.
             mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
@@ -179,10 +193,55 @@ class MoECommMethod(ABC):
             expert_tokens=token_dispatch_output.group_list,
         )
 
-    def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
+    def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> tuple[torch.Tensor, object | None]:
         raise NotImplementedError(
             "Comm method must either override _apply_mlp or receive a quant_method "
-            "so the MLP stage can be orchestrated by MoeActionMethod."
+            " so the MLP stage can be orchestrated by MoeActionMethod."
+        )
+
+    def _apply_mlp_dispatched(
+        self,
+        mlp_compute_input: MoEMlpComputeInput,
+        quant_method,
+    ) -> tuple[torch.Tensor, object | None]:
+        """Apply the MLP once, honoring the 0.30.0 quant_method orchestration."""
+        if quant_method is None:
+            return self._apply_mlp(mlp_compute_input)
+        return apply_moe_mlp(mlp_compute_input, quant_method)
+
+    def _apply_mlp_with_optional_chunking(
+        self,
+        mlp_compute_input: MoEMlpComputeInput,
+        quant_method=None,
+    ) -> tuple[torch.Tensor, object | None]:
+        """Chunk only the local routed expert MLP, never dispatch/combine."""
+        if not supports_moe_ffn_chunking(mlp_compute_input):
+            return self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+
+        hidden_states = mlp_compute_input.hidden_states
+        intermediate_size = getattr(self.moe_config, "intermediate_size_per_partition", -1)
+        if intermediate_size <= 0:
+            intermediate_size = self.moe_config.intermediate_size
+        # The Dense-FFN heuristic assumes one FFN row per original token.
+        # Routed MoE expands each token into ``experts_per_token`` rows, so use
+        # the corresponding effective intermediate width for the same memory
+        # target. The actual minimum-size cap still uses local routed rows.
+        num_chunks = estimate_moe_ffn_num_chunks(
+            num_routed_tokens=hidden_states.shape[0],
+            hidden_size=hidden_states.shape[-1],
+            intermediate_size=intermediate_size,
+            experts_per_token=self.moe_config.experts_per_token,
+            live_factor=self.ffn_chunk_live_factor,
+            target_hidden_factor=self.ffn_chunk_target_hidden_factor,
+            min_chunk_size=self.ffn_min_chunk_size,
+        )
+        if num_chunks <= 1:
+            return self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+
+        return run_moe_ffn_in_token_chunks(
+            mlp_compute_input,
+            num_chunks=num_chunks,
+            apply_mlp=lambda chunk: self._apply_mlp_dispatched(chunk, quant_method),
         )
 
     @abstractmethod

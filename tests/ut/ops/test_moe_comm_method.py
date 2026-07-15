@@ -17,6 +17,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     FusedMC2CommImpl,
     MC2CommImpl,
 )
+from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
 from vllm_ascend.quantization.methods.base import QuantType
 
@@ -240,6 +241,43 @@ class TestMoECommMethod(TestBase):
             self.assertNotIn("activation_clamp", kwargs)
             self.assertIsNone(kwargs["x_active_mask"])
             self.assertEqual(kwargs["weight1_type"], 296)
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
+    def test_apply_mlp_chunks_only_routed_expert_compute(self, mock_token_dispatcher, mock_prepare_finalize):
+        self.mock_ascend_config.enable_ffn_chunking = True
+        self.mock_ascend_config.ffn_chunk_live_factor = 3.0
+        self.mock_ascend_config.ffn_chunk_target_hidden_factor = 2.0
+        self.mock_ascend_config.ffn_min_chunk_size = 2
+        self.moe_config.intermediate_size_per_partition = 8
+        self.moe_config.intermediate_size = 8
+        comm_impl = AllGatherCommImpl(self.moe_config)
+        hidden_states = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+        mlp_input = MoEMlpComputeInput(
+            hidden_states=hidden_states,
+            group_list=torch.tensor([3, 2, 4]),
+            group_list_type=1,
+            dynamic_scale=None,
+            topk_scales=None,
+            weights=MoEWeights(w1=torch.empty(0), w2=torch.empty(0)),
+            quant=MoEQuantParams(),
+            fusion=False,
+        )
+        seen_group_lists = []
+
+        def fake_apply_mlp(value):
+            seen_group_lists.append(value.group_list.clone())
+            return value.hidden_states + 1, None
+
+        comm_impl._apply_mlp = fake_apply_mlp
+        output, _ = comm_impl._apply_mlp_with_optional_chunking(mlp_input)
+
+        torch.testing.assert_close(output, hidden_states + 1)
+        assert [value.tolist() for value in seen_group_lists] == [
+            [3, 0, 0],
+            [0, 2, 0],
+            [0, 0, 2],
+            [0, 0, 2],
+        ]
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
