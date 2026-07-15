@@ -349,6 +349,10 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
         self.assertEqual(ascend_config.mega_moe_max_tokens, 65536)
+        self.assertFalse(ascend_config.enable_ffn_chunking)
+        self.assertEqual(ascend_config.ffn_chunk_live_factor, 3.0)
+        self.assertEqual(ascend_config.ffn_chunk_target_hidden_factor, 2.0)
+        self.assertEqual(ascend_config.ffn_min_chunk_size, 1024)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -533,6 +537,99 @@ class TestAscendConfig(TestBase):
         self.assertEqual(scheduler_config.short_request_first_config.threshold, 512)
         self.assertFalse(scheduler_config.profiling_chunk_config.enabled)
         self.assertFalse(scheduler_config.batch_job_sched_config.enabled)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_ffn_chunking_is_enabled_only_for_eager_sfa_sparse_model(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        sparse_hf_config = SimpleNamespace(index_topk=512)
+        model_config = self._make_model_config(is_deepseek_mla=True)
+        model_config.hf_config = sparse_hf_config
+        model_config.hf_text_config = sparse_hf_config
+        test_vllm_config.model_config = model_config
+        test_vllm_config.additional_config = {
+            "enable_ffn_chunking": True,
+            "ffn_chunk_live_factor": 4,
+            "ffn_chunk_target_hidden_factor": 2.5,
+            "ffn_min_chunk_size": 2048,
+            "refresh": True,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.enable_ffn_chunking)
+        self.assertEqual(ascend_config.ffn_chunk_live_factor, 4.0)
+        self.assertEqual(ascend_config.ffn_chunk_target_hidden_factor, 2.5)
+        self.assertEqual(ascend_config.ffn_min_chunk_size, 2048)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_ffn_chunking_is_ignored_for_non_sparse_model(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        model_config = self._make_model_config()
+        model_config.hf_config = SimpleNamespace()
+        model_config.hf_text_config = model_config.hf_config
+        test_vllm_config.model_config = model_config
+        test_vllm_config.additional_config = {"enable_ffn_chunking": True, "refresh": True}
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertFalse(ascend_config.enable_ffn_chunking)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_ffn_chunking_is_ignored_for_compressed_sparse_model(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        compressed_hf_config = SimpleNamespace(index_topk=512, compress_ratios=[4])
+        model_config = self._make_model_config(is_deepseek_mla=True)
+        model_config.hf_config = compressed_hf_config
+        model_config.hf_text_config = compressed_hf_config
+        test_vllm_config.model_config = model_config
+        test_vllm_config.additional_config = {"enable_ffn_chunking": True, "refresh": True}
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertFalse(ascend_config.enable_ffn_chunking)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_ffn_chunking_rejects_graph_mode(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        sparse_hf_config = SimpleNamespace(index_topk=512)
+        model_config = self._make_model_config(is_deepseek_mla=True)
+        model_config.hf_config = sparse_hf_config
+        model_config.hf_text_config = sparse_hf_config
+        model_config.enforce_eager = False
+        test_vllm_config.model_config = model_config
+        test_vllm_config.additional_config = {"enable_ffn_chunking": True, "refresh": True}
+
+        with self.assertRaisesRegex(ValueError, "requires eager mode"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_ffn_chunking_rejects_invalid_config(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        sparse_hf_config = SimpleNamespace(index_topk=512)
+        model_config = self._make_model_config(is_deepseek_mla=True)
+        model_config.hf_config = sparse_hf_config
+        model_config.hf_text_config = sparse_hf_config
+        test_vllm_config.model_config = model_config
+        invalid_configs = [
+            ({"enable_ffn_chunking": 1}, "must be a boolean"),
+            ({"ffn_chunk_live_factor": True}, "must be a number"),
+            ({"ffn_chunk_live_factor": 0}, "finite and positive"),
+            ({"ffn_chunk_live_factor": float("nan")}, "finite and positive"),
+            ({"ffn_chunk_target_hidden_factor": float("inf")}, "finite and positive"),
+            ({"ffn_min_chunk_size": True}, "must be an integer"),
+            ({"ffn_min_chunk_size": 0}, "must be positive"),
+        ]
+
+        for additional_config, error_pattern in invalid_configs:
+            test_vllm_config.additional_config = {**additional_config, "refresh": True}
+            with self.subTest(additional_config=additional_config), self.assertRaisesRegex(ValueError, error_pattern):
+                init_ascend_config(test_vllm_config)
+            clear_ascend_config()
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
