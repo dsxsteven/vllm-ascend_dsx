@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -33,6 +34,7 @@ from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, buil
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
 from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
+    balanced_chunk_ranges,
     estimate_moe_ffn_num_chunks,
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
@@ -53,6 +55,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[tuple[MoECommType | None, tuple[int, ...]], MoECommMethod] = {}
+_MIB = 1024**2
 
 
 def _moe_config_key(
@@ -104,18 +107,21 @@ class MoECommMethod(ABC):
         self.prepare_finalize = self._get_prepare_finalize()
         self.lora_context = None
 
-    def set_lora_context(self, lora_context) -> None:
-        self.lora_context = lora_context
-        self.prepare_finalize.set_lora_context(lora_context)
-        self.token_dispatcher.set_lora_context(lora_context)
-
         ascend_config = get_ascend_config()
         self.enable_ffn_chunking = getattr(ascend_config, "enable_ffn_chunking", False) is True
+        self.ffn_chunk_memory_debug = getattr(ascend_config, "ffn_chunk_memory_debug", False) is True
+        self._ffn_chunk_memory_debug_max_tokens = -1
+        self._last_ffn_num_chunks = 1
         if self.enable_ffn_chunking:
             self.ffn_chunk_live_factor = ascend_config.ffn_chunk_live_factor
             self.ffn_chunk_target_hidden_factor = ascend_config.ffn_chunk_target_hidden_factor
             self.ffn_min_chunk_size = ascend_config.ffn_min_chunk_size
             self._ffn_chunking_active_logged = False
+
+    def set_lora_context(self, lora_context) -> None:
+        self.lora_context = lora_context
+        self.prepare_finalize.set_lora_context(lora_context)
+        self.token_dispatcher.set_lora_context(lora_context)
 
     def prepare(
         self,
@@ -171,13 +177,17 @@ class MoECommMethod(ABC):
             moe_config=self.moe_config,
         )
         if self.enable_ffn_chunking:
-            mlp_output, before_gmm2_evt = self._apply_mlp_with_optional_chunking(mlp_compute_input, quant_method)
-        elif quant_method is None:
-            # Legacy path (310P): the comm method overrides ``_apply_mlp`` with
-            # its own MLP implementation.
-            mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
+            apply_mlp = lambda chunk: self._apply_mlp_with_optional_chunking(chunk, quant_method)
         else:
-            mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method)
+            apply_mlp = lambda chunk: self._apply_mlp_dispatched(chunk, quant_method)
+        if (
+            self.ffn_chunk_memory_debug
+            and mlp_compute_input.hidden_states.shape[0] > self._ffn_chunk_memory_debug_max_tokens
+            and not getattr(_EXTRA_CTX, "in_profile_run", False)
+        ):
+            mlp_output, before_gmm2_evt = self._apply_mlp_with_memory_debug(mlp_compute_input, apply_mlp)
+        else:
+            mlp_output, before_gmm2_evt = apply_mlp(mlp_compute_input)
 
         before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
@@ -210,12 +220,86 @@ class MoECommMethod(ABC):
             return self._apply_mlp(mlp_compute_input)
         return apply_moe_mlp(mlp_compute_input, quant_method)
 
+    def _apply_mlp_with_memory_debug(
+        self,
+        mlp_compute_input: MoEMlpComputeInput,
+        apply_mlp: Callable[[MoEMlpComputeInput], tuple[torch.Tensor, object | None]],
+    ) -> tuple[torch.Tensor, object | None]:
+        """Measure one Routed Expert FFN high-water invocation in isolation."""
+        torch.npu.synchronize()
+        torch.npu.reset_peak_memory_stats()
+        allocated_before = int(torch.npu.memory_allocated())
+        reserved_before = int(torch.npu.memory_reserved())
+
+        result = apply_mlp(mlp_compute_input)
+
+        torch.npu.synchronize()
+        allocated_after = int(torch.npu.memory_allocated())
+        reserved_after = int(torch.npu.memory_reserved())
+        peak_allocated = int(torch.npu.max_memory_allocated())
+        peak_growth = max(0, peak_allocated - allocated_before)
+        retained_delta = allocated_after - allocated_before
+        # The FFN output remains live after this scope. Subtract both the
+        # entry and exit live sets so this metric better represents temporary
+        # GMM/SwiGLU activations that chunking is intended to reduce.
+        transient_peak = max(0, peak_allocated - max(allocated_before, allocated_after))
+        reserved_delta = reserved_after - reserved_before
+
+        mlp_output = result[0]
+        input_bytes = mlp_compute_input.hidden_states.numel() * mlp_compute_input.hidden_states.element_size()
+        output_bytes = mlp_output.numel() * mlp_output.element_size()
+        num_tokens = mlp_compute_input.hidden_states.shape[0]
+        chunk_sizes = [end - start for start, end in balanced_chunk_ranges(num_tokens, self._last_ffn_num_chunks)]
+        largest_chunk_ratio = max(chunk_sizes) / num_tokens if num_tokens else 1.0
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        if self._last_ffn_num_chunks > 1:
+            mode = "chunked"
+        elif self.enable_ffn_chunking:
+            mode = "bypassed"
+        else:
+            mode = "no_chunk"
+        logger.warning(
+            "[fused_moe][ffn_memory_debug] rank=%s, mode=%s, comm_method=%s, routed_tokens=%s, "
+            "num_chunks=%s, chunk_sizes=%s, largest_chunk_ratio=%.3f, "
+            "input=%.3f MiB, output=%.3f MiB | "
+            "allocated: before=%.3f MiB, peak=%.3f MiB, after=%.3f MiB, "
+            "peak_growth=%.3f MiB, retained_delta=%+.3f MiB, "
+            "transient_peak_above_live=%.3f MiB | "
+            "reserved: before=%.3f MiB, after=%.3f MiB, delta=%+.3f MiB. "
+            "Metrics cover the PyTorch NPU caching allocator only.",
+            rank,
+            mode,
+            type(self).__name__,
+            num_tokens,
+            self._last_ffn_num_chunks,
+            chunk_sizes,
+            largest_chunk_ratio,
+            input_bytes / _MIB,
+            output_bytes / _MIB,
+            allocated_before / _MIB,
+            peak_allocated / _MIB,
+            allocated_after / _MIB,
+            peak_growth / _MIB,
+            retained_delta / _MIB,
+            transient_peak / _MIB,
+            reserved_before / _MIB,
+            reserved_after / _MIB,
+            reserved_delta / _MIB,
+        )
+        self._ffn_chunk_memory_debug_max_tokens = num_tokens
+        return result
+
     def _apply_mlp_with_optional_chunking(
         self,
         mlp_compute_input: MoEMlpComputeInput,
         quant_method=None,
     ) -> tuple[torch.Tensor, object | None]:
         """Chunk only the local routed expert MLP, never dispatch/combine."""
+        self._last_ffn_num_chunks = 1
         if not supports_moe_ffn_chunking(mlp_compute_input):
             return self._apply_mlp_dispatched(mlp_compute_input, quant_method)
 
@@ -238,6 +322,7 @@ class MoECommMethod(ABC):
         )
         if num_chunks <= 1:
             return self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+        self._last_ffn_num_chunks = num_chunks
 
         if not self._ffn_chunking_active_logged:
             logger.info_once(
