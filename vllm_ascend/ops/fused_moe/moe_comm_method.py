@@ -115,6 +115,7 @@ class MoECommMethod(ABC):
             self.ffn_chunk_live_factor = ascend_config.ffn_chunk_live_factor
             self.ffn_chunk_target_hidden_factor = ascend_config.ffn_chunk_target_hidden_factor
             self.ffn_min_chunk_size = ascend_config.ffn_min_chunk_size
+            self._ffn_chunking_active_logged = False
 
     def prepare(
         self,
@@ -237,6 +238,20 @@ class MoECommMethod(ABC):
         )
         if num_chunks <= 1:
             return self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+
+        if not self._ffn_chunking_active_logged:
+            logger.info_once(
+                "[fused_moe] MoE FFN token chunking is active: comm_method=%s, "
+                "routed_tokens=%s, hidden_size=%s, intermediate_size=%s, "
+                "experts_per_token=%s, num_chunks=%s.",
+                type(self).__name__,
+                hidden_states.shape[0],
+                hidden_states.shape[-1],
+                intermediate_size,
+                self.moe_config.experts_per_token,
+                num_chunks,
+            )
+            self._ffn_chunking_active_logged = True
 
         return run_moe_ffn_in_token_chunks(
             mlp_compute_input,
