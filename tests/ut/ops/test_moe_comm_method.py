@@ -245,9 +245,7 @@ class TestMoECommMethod(TestBase):
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
     def test_apply_mlp_chunks_only_routed_expert_compute(self, mock_token_dispatcher, mock_prepare_finalize):
         self.mock_ascend_config.enable_ffn_chunking = True
-        self.mock_ascend_config.ffn_chunk_live_factor = 3.0
-        self.mock_ascend_config.ffn_chunk_target_hidden_factor = 2.0
-        self.mock_ascend_config.ffn_min_chunk_size = 2
+        self.mock_ascend_config.ffn_chunk_size = 2
         self.moe_config.intermediate_size_per_partition = 8
         self.moe_config.intermediate_size = 8
         comm_impl = AllGatherCommImpl(self.moe_config)
@@ -277,14 +275,59 @@ class TestMoECommMethod(TestBase):
         mock_info_once.assert_called_once()
         assert "MoE FFN token chunking is active" in mock_info_once.call_args.args[0]
         assert [value.tolist() for value in seen_group_lists] == [
-            [3, 0, 0],
-            [0, 2, 0],
+            [2, 0, 0],
+            [1, 1, 0],
+            [0, 1, 1],
             [0, 0, 2],
-            [0, 0, 2],
+            [0, 0, 1],
         ] * 2
 
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
+    def test_apply_mlp_memory_debug_reports_moe_peak(self, mock_token_dispatcher, mock_prepare_finalize):
+        self.mock_ascend_config.ffn_chunk_memory_debug = True
+        comm_impl = AllGatherCommImpl(self.moe_config)
+        comm_impl.enable_ffn_chunking = True
+        comm_impl._last_ffn_num_chunks = 2
+        hidden_states = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+        mlp_input = MoEMlpComputeInput(
+            hidden_states=hidden_states,
+            group_list=torch.tensor([3, 2, 4]),
+            group_list_type=1,
+            dynamic_scale=None,
+            topk_scales=None,
+            weights=MoEWeights(w1=torch.empty(0), w2=torch.empty(0)),
+            quant=MoEQuantParams(),
+            fusion=False,
+        )
+        output = hidden_states + 1
+        event = object()
+        mib = 1 << 20
+
+        with (
+            patch("torch.npu.synchronize") as mock_synchronize,
+            patch("torch.npu.reset_peak_memory_stats") as mock_reset_peak,
+            patch("torch.npu.memory_allocated", return_value=100 * mib),
+            patch("torch.npu.max_memory_allocated", return_value=150 * mib),
+            patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.warning") as mock_warning,
+        ):
+            actual = comm_impl._apply_mlp_with_memory_debug(mlp_input, lambda _: (output, event))
+
+        assert actual[0] is output
+        assert actual[1] is event
+        assert mock_synchronize.call_count == 2
+        mock_reset_peak.assert_called_once_with()
+        assert comm_impl._ffn_chunk_memory_debug_logged
+        log_args = mock_warning.call_args.args
+        rendered_log = log_args[0] % log_args[1:]
+        assert "[MOE_MEMORY]" in rendered_log
+        assert "ffn_chunk=ON" in rendered_log
+        assert "routed_tokens=9" in rendered_log
+        assert "num_chunks=2" in rendered_log
+        assert "moe_peak_allocated=150.000 MiB" in rendered_log
+        assert "moe_peak_increase=50.000 MiB" in rendered_log
+
+
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
