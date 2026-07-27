@@ -23,6 +23,7 @@ from time import time_ns
 from typing import cast
 
 import torch
+from vllm.distributed import get_dp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -36,9 +37,11 @@ from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, buil
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
 from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
+    fixed_chunk_ranges,
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
 )
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import slice_fused_experts_input_along_tokens
 from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
@@ -81,6 +84,33 @@ def setup_moe_comm_method(moe_config):
         _MoECommMethods[_moe_config_key(MoECommType.FUSED_MC2, moe_config)] = FusedMC2CommImpl(moe_config)
     else:
         _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, moe_config)] = AllGatherCommImpl(moe_config)
+
+
+def _num_tokens_uniform_across_dp(num_tokens: int, moe_config: FusedMoEConfig) -> bool:
+    """Whether every DP rank holds the same ``num_tokens`` this step.
+
+    The end-to-end FFN chunk path issues one dispatch/combine collective per
+    chunk. Collective call counts must match across the whole EP group, so
+    chunk boundaries (derived from ``num_tokens``) must be identical on every
+    rank. TP ranks always share the batch; DP ranks can diverge under async
+    scheduling. A single MIN/MAX all-reduce lets every rank reach the same
+    decision: all chunk, or all fall back.
+    """
+    if getattr(moe_config, "dp_size", 1) <= 1:
+        return True
+    dp_group = get_dp_group()
+    if dp_group.world_size <= 1:
+        return True
+    if get_ascend_config().dp_allreduce_on_npu:
+        payload = torch.tensor([num_tokens, -num_tokens], dtype=torch.int64, device="npu")
+        group = dp_group.device_group
+    else:
+        payload = torch.tensor([num_tokens, -num_tokens], dtype=torch.int64)
+        group = dp_group.cpu_group
+    torch.distributed.all_reduce(payload, op=torch.distributed.ReduceOp.MAX, group=group)
+    max_tokens = int(payload[0].item())
+    min_tokens = int(-payload[1].item())
+    return max_tokens == min_tokens
 
 
 @dataclass
@@ -243,6 +273,16 @@ class MoECommMethod(ABC):
         # token count before apply_mlp() so OFF-path logs and snapshot names do
         # not observe the disposed tensor.
         num_tokens = int(mlp_compute_input.hidden_states.shape[0])
+        return self._run_with_memory_debug(num_tokens, lambda: apply_mlp(mlp_compute_input))
+
+    def _run_with_memory_debug(self, num_tokens: int, run: Callable[[], object]):
+        """Measure the peak allocated memory of one MoE FFN invocation.
+
+        ``run`` is executed between two NPU synchronizations with peak-memory
+        stats reset, and an optional allocator-history snapshot is dumped
+        around it. ``num_tokens`` is taken before ``run`` because quantized
+        MLP implementations may dispose input tensors in place.
+        """
         rank = (
             torch.distributed.get_rank()
             if torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -251,7 +291,6 @@ class MoECommMethod(ABC):
         should_dump_snapshot = self.ffn_chunk_memory_snapshot_dir is not None and (
             self.ffn_chunk_memory_snapshot_rank == -1 or self.ffn_chunk_memory_snapshot_rank == rank
         )
-        # print(f"should_dump_snapshot={should_dump_snapshot}")
         history_started = False
         if should_dump_snapshot:
             try:
@@ -270,7 +309,7 @@ class MoECommMethod(ABC):
         allocated_before = int(torch.npu.memory_allocated())
 
         try:
-            result = apply_mlp(mlp_compute_input)
+            result = run()
             torch.npu.synchronize()
             peak_allocated = int(torch.npu.max_memory_allocated())
 
@@ -426,6 +465,148 @@ class AlltoAllCommImpl(MoECommMethod):
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithAll2All(self.moe_config)
+
+    def fused_experts(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        quant_method=None,
+    ):
+        num_tokens = fused_experts_input.hidden_states.shape[0]
+        if not self._should_chunk_e2e(num_tokens):
+            should_debug_memory = (
+                self.ffn_chunk_memory_debug
+                and not self._ffn_chunk_memory_debug_logged
+                and not getattr(_EXTRA_CTX, "in_profile_run", False)
+            )
+            if should_debug_memory:
+                # Measure at the same fused_experts scope as the chunked path
+                # (whole dispatch/MLP/combine chain, pre-dispatch token count)
+                # so OFF/ON snapshots pair by (rank, num_tokens) in the
+                # analyzer. Suppress the base class's inner apply_mlp-level
+                # measurement to avoid a double capture.
+                self._ffn_chunk_memory_debug_logged = True
+                self._last_ffn_num_chunks = 1
+                return self._run_with_memory_debug(
+                    num_tokens, lambda: MoECommMethod.fused_experts(self, fused_experts_input, quant_method)
+                )
+            return super().fused_experts(fused_experts_input, quant_method)
+
+        self._last_ffn_num_chunks = (num_tokens + self.ffn_chunk_size - 1) // self.ffn_chunk_size
+        if not getattr(self, "_ffn_chunking_active_logged", False):
+            logger.info_once(
+                "[fused_moe] MoE end-to-end FFN token chunking is active: comm_method=%s, "
+                "num_tokens=%s, hidden_size=%s, chunk_size=%s, num_chunks=%s. "
+                "dispatch/MLP/combine all run per chunk.",
+                type(self).__name__,
+                num_tokens,
+                fused_experts_input.hidden_states.shape[-1],
+                self.ffn_chunk_size,
+                self._last_ffn_num_chunks,
+            )
+            self._ffn_chunking_active_logged = True
+
+        should_debug_memory = (
+            self.ffn_chunk_memory_debug
+            and not self._ffn_chunk_memory_debug_logged
+            and not getattr(_EXTRA_CTX, "in_profile_run", False)
+        )
+        if should_debug_memory:
+            return self._run_with_memory_debug(
+                num_tokens, lambda: self._fused_experts_chunked_e2e(fused_experts_input, quant_method)
+            )
+        return self._fused_experts_chunked_e2e(fused_experts_input, quant_method)
+
+    def _should_chunk_e2e(self, num_tokens: int) -> bool:
+        """Whether to chunk the whole dispatch/MLP/combine chain by raw tokens.
+
+        Only the All2AllV dispatcher is validated for repeated per-chunk
+        calls; the MC2 combine kernel's sub-batch contract is unverified, so
+        this override exists only on ``AlltoAllCommImpl``. Chunk boundaries
+        must be uniform across the EP group (every chunk issues collectives),
+        which is guaranteed once DP token counts match.
+        """
+        if not self.enable_ffn_chunking or num_tokens <= self.ffn_chunk_size:
+            return False
+        return _num_tokens_uniform_across_dp(num_tokens, self.moe_config)
+
+    def _fused_experts_chunked_e2e(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        quant_method=None,
+    ) -> FusedExpertsResult:
+        """Run dispatch -> MLP -> combine per raw-token chunk.
+
+        Each chunk is an independent dispatch/combine round trip: the
+        dispatched activation (``expand_x``), the GMM intermediates and the
+        combine workspace all live only for the duration of one chunk, so
+        their peak scales with ``ffn_chunk_size`` instead of the full batch.
+        The final outputs are accumulated into a single preallocated
+        ``routed_out`` buffer, which ``finalize`` consumes afterwards exactly
+        as in the unchunked path.
+        """
+        num_tokens = fused_experts_input.hidden_states.shape[0]
+        ranges = list(fixed_chunk_ranges(num_tokens, self.ffn_chunk_size))
+
+        # Earliest dispatch event lets the shared-expert stream start as soon
+        # as the first chunk's dispatch begins; the latest GMM2/combine events
+        # keep it from racing ahead of the last chunk (see the single-arc
+        # semantics in the base implementation).
+        before_dispatch_evt = torch.npu.current_stream().record_event()
+
+        routed_out: torch.Tensor | None = None
+        expert_tokens: torch.Tensor | None = None
+        group_list_type = 1
+        before_gmm2_evt = None
+        before_combine_evt = None
+
+        for start, end in ranges:
+            chunk_input = slice_fused_experts_input_along_tokens(fused_experts_input, start, end)
+            # NOTE: unlike 0.23.0, the log2phy remap already happened upstream
+            # in AscendMoERunner.apply_routed_experts, so chunk_input.topk_ids
+            # is already physical expert ids.
+            token_dispatch_input = build_token_dispatch_input(
+                fused_experts_input=chunk_input,
+            )
+            token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+
+            chunk_group_list = token_dispatch_output.group_list
+            group_list_type = token_dispatch_output.group_list_type
+
+            mlp_compute_input = build_mlp_compute_input(
+                fused_experts_input=chunk_input,
+                token_dispatch_output=token_dispatch_output,
+                moe_config=self.moe_config,
+            )
+            mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+            before_combine_evt = torch.npu.current_stream().record_event()
+            chunk_routed_out = self.token_dispatcher.token_combine(
+                hidden_states=mlp_output,
+                combine_metadata=token_dispatch_output.combine_metadata,
+            )
+            del mlp_output, token_dispatch_output
+
+            if routed_out is None:
+                routed_out = chunk_routed_out.new_empty((num_tokens, *chunk_routed_out.shape[1:]))
+            routed_out[start:end].copy_(chunk_routed_out)
+            del chunk_routed_out
+
+            if chunk_group_list is not None:
+                # Per-expert token counts are partial per chunk; EPLB heat
+                # collection needs the total across the whole batch.
+                if expert_tokens is None:
+                    expert_tokens = chunk_group_list.clone()
+                else:
+                    expert_tokens += chunk_group_list
+
+        assert routed_out is not None
+        return FusedExpertsResult(
+            routed_out=routed_out,
+            before_dispatch_evt=before_dispatch_evt,
+            before_gmm2_evt=before_gmm2_evt,
+            before_combine_evt=before_combine_evt,
+            group_list_type=group_list_type,
+            expert_tokens=expert_tokens,
+        )
 
 
 class FusedMC2CommImpl(MoECommMethod):
