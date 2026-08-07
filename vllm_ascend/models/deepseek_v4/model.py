@@ -24,6 +24,7 @@
 # limitations under the License.
 #
 import math
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -44,6 +45,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -666,6 +668,37 @@ class DeepseekV4Attention(nn.Module):
         return self.dsa_attn(positions, hidden_states, llama_4_scaling)
 
 
+_ACT_PEAK_ON = os.environ.get("VLLM_DS4_ACT_PEAK") == "1"
+# Optional comma-separated layer filter; empty means all layers.
+_ACT_PEAK_LAYERS = {
+    int(item) for item in os.environ.get("VLLM_DS4_ACT_PEAK_LAYERS", "").split(",") if item.strip()
+}
+
+
+def _measure_act_peak(layer_idx: int, module: str, fn):
+    """Run fn() and log its allocated-bytes peak growth (MiB).
+
+    Enabled with VLLM_DS4_ACT_PEAK=1; VLLM_DS4_ACT_PEAK_LAYERS="5,6" limits
+    logging to specific layers. The synchronizes bracket the call so async
+    allocs/frees from neighboring modules cannot leak into this measurement.
+    """
+    torch.npu.synchronize()
+    torch.npu.reset_peak_memory_stats()
+    before = int(torch.npu.memory_allocated())
+    out = fn()
+    torch.npu.synchronize()
+    increase = max(0, int(torch.npu.max_memory_allocated()) - before)
+    if not _ACT_PEAK_LAYERS or layer_idx in _ACT_PEAK_LAYERS:
+        logger.warning(
+            "[ACT_PEAK] layer=%d module=%s before=%.1f MiB increase=%.1f MiB",
+            layer_idx,
+            module,
+            before / 2**20,
+            increase / 2**20,
+        )
+    return out
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -769,7 +802,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
-        hidden_states = self.self_attn(**attn_kwargs)
+        if _ACT_PEAK_ON:
+            hidden_states = _measure_act_peak(self.layer_idx, "attention", lambda: self.self_attn(**attn_kwargs))
+        else:
+            hidden_states = self.self_attn(**attn_kwargs)
 
         if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
             hidden_states = sp_reduce_scatter(hidden_states)
@@ -779,11 +815,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states, hidden_states_fp32 = self.rms_norm_cast(hidden_states)
-        hidden_states = self.mlp(
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
-        )
+        if _ACT_PEAK_ON:
+            hidden_states = _measure_act_peak(
+                self.layer_idx, "moe", lambda: self.mlp(hidden_states, input_ids=input_ids, hidden_states_fp32=hidden_states_fp32)
+            )
+        else:
+            hidden_states = self.mlp(
+                hidden_states,
+                input_ids=input_ids,
+                hidden_states_fp32=hidden_states_fp32,
+            )
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual

@@ -18,6 +18,8 @@ from collections.abc import Iterable
 from copy import copy
 from types import SimpleNamespace
 
+import os
+
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
@@ -677,7 +679,13 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             forward_context.moe_layer_index = moe_layer_index
 
         # Load balancing for token distribution among experts in dummy_run.
-        enable_force_load_balance = _EXTRA_CTX.in_profile_run
+        # Default: profile runs only (balanced shapes, real routing at
+        # runtime). VLLM_ASCEND_FORCE_LOAD_BALANCE=1 forces it on for real
+        # requests too — randomizes routing, outputs become garbage; use
+        # only for memory/perf experiments.
+        enable_force_load_balance = _EXTRA_CTX.in_profile_run or os.environ.get(
+            "VLLM_ASCEND_FORCE_LOAD_BALANCE"
+        ) == "1"
 
         lora_context = getattr(self, "_ascend_moe_lora_context", None)
         moe_comm_method = get_moe_comm_method(_EXTRA_CTX.moe_comm_type, self.moe_config)
