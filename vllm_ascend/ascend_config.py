@@ -893,17 +893,6 @@ class AscendConfig:
                 f"{type(enable_ffn_chunking).__name__}: {enable_ffn_chunking}"
             )
 
-        legacy_ffn_chunk_keys = {
-            "ffn_chunk_live_factor",
-            "ffn_chunk_target_hidden_factor",
-            "ffn_min_chunk_size",
-        }
-        configured_legacy_keys = sorted(legacy_ffn_chunk_keys.intersection(additional_config))
-        if configured_legacy_keys:
-            raise ValueError(
-                f"{configured_legacy_keys} are no longer supported; configure ffn_chunk_size instead."
-            )
-
         ffn_chunk_size = additional_config.get("ffn_chunk_size", 4096)
         if isinstance(ffn_chunk_size, bool) or not isinstance(ffn_chunk_size, int):
             raise ValueError(
