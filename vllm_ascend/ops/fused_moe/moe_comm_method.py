@@ -21,7 +21,6 @@ from typing import cast
 
 import torch
 from vllm.distributed import get_dp_group
-from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
