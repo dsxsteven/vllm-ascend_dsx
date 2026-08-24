@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,7 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 from vllm_ascend.models.deepseek_v4.model import (
@@ -110,6 +112,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         self.norm_eps = config.rms_norm_eps
         self.hc_norm = RMSNorm(hc_dim, eps=config.rms_norm_eps, has_weight=False, dtype=torch.float32)
+        self.activation_peak_debug = bool(getattr(get_ascend_config(), "activation_peak_debug", False))
 
     def forward(
         self,
@@ -120,31 +123,44 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # masking inputs at position 0, as not needed by MTP
-        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
-        inputs_embeds = self.enorm(inputs_embeds)
-        previous_hidden_states = previous_hidden_states.view(-1, self.hc_mult, self.config.hidden_size)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
+        num_tokens = previous_hidden_states.shape[0]
+        activation_peak_active = self.activation_peak_debug and is_activation_peak_profiling()
+        input_peak_context = (
+            record_activation_peak(
+                "mtp_input_fusion",
+                f"mtp.layer.{spec_step_index}.input_fusion",
+                layer_idx=spec_step_index,
+                num_tokens=num_tokens,
+            )
+            if activation_peak_active
+            else nullcontext()
+        )
+        with input_peak_context:
+            # masking inputs at position 0, as not needed by MTP
+            inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+            inputs_embeds = self.enorm(inputs_embeds)
+            previous_hidden_states = previous_hidden_states.view(-1, self.hc_mult, self.config.hidden_size)
+            previous_hidden_states = self.hnorm(previous_hidden_states)
 
-        full_num_tokens = positions.shape[0]
-        use_sp = self.mtp_block.use_sequence_parallel_moe
-        # Shard the mask only for the duration of this forward: the same
-        # forward_context is reused across draft steps with full-length
-        # inputs, so a sharded mask must not leak to the next step.
-        orig_is_padding = None
-        forward_context = None
-        if use_sp:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                orig_is_padding = forward_context.is_padding
-                forward_context.is_padding = sp_padding_mask(orig_is_padding, inputs_embeds)
-            # sp_shard supports arbitrary leading dims; upstream
-            # sequence_parallel_chunk only pads 2D correctly and would pad
-            # the hc_mult dim of [N, hc_mult, H] instead of the token dim.
-            inputs_embeds = sp_shard(inputs_embeds)
-            previous_hidden_states = sp_shard(previous_hidden_states)
+            full_num_tokens = positions.shape[0]
+            use_sp = self.mtp_block.use_sequence_parallel_moe
+            # Shard the mask only for the duration of this forward: the same
+            # forward_context is reused across draft steps with full-length
+            # inputs, so a sharded mask must not leak to the next step.
+            orig_is_padding = None
+            forward_context = None
+            if use_sp:
+                if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                    forward_context = get_forward_context()
+                    orig_is_padding = forward_context.is_padding
+                    forward_context.is_padding = sp_padding_mask(orig_is_padding, inputs_embeds)
+                # sp_shard supports arbitrary leading dims; upstream
+                # sequence_parallel_chunk only pads 2D correctly and would pad
+                # the hc_mult dim of [N, hc_mult, H] instead of the token dim.
+                inputs_embeds = sp_shard(inputs_embeds)
+                previous_hidden_states = sp_shard(previous_hidden_states)
 
-        hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(previous_hidden_states)
+            hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(previous_hidden_states)
 
         hidden_states, residual = self.mtp_block(
             positions=positions,
@@ -199,6 +215,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.activation_peak_debug = bool(getattr(get_ascend_config(), "activation_peak_debug", False))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -227,14 +244,30 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        current_step_idx = spec_step_idx % self.num_mtp_layers
-        mtp_layer = self.layers[str(current_step_idx)]
-        hidden_states = hidden_states.view(-1, mtp_layer.hc_mult, mtp_layer.config.hidden_size)
-        hidden_states = mtp_layer.hc_head(
-            hidden_states, mtp_layer.hc_head_fn, mtp_layer.hc_head_scale, mtp_layer.hc_head_base
+        num_tokens = hidden_states.shape[0]
+        activation_peak_active = self.activation_peak_debug and is_activation_peak_profiling()
+        head_peak_context = (
+            record_activation_peak(
+                "mtp_head",
+                f"mtp.layer.{spec_step_idx}.head",
+                layer_idx=spec_step_idx,
+                num_tokens=num_tokens,
+            )
+            if activation_peak_active
+            else nullcontext()
         )
-        logits = self.logits_processor(mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states))
-        return logits
+        with head_peak_context:
+            current_step_idx = spec_step_idx % self.num_mtp_layers
+            mtp_layer = self.layers[str(current_step_idx)]
+            hidden_states = hidden_states.view(-1, mtp_layer.hc_mult, mtp_layer.config.hidden_size)
+            hidden_states = mtp_layer.hc_head(
+                hidden_states,
+                mtp_layer.hc_head_fn,
+                mtp_layer.hc_head_scale,
+                mtp_layer.hc_head_base,
+            )
+            logits = self.logits_processor(mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states))
+            return logits
 
 
 @support_torch_compile
