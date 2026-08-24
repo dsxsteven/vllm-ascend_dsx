@@ -886,6 +886,32 @@ class AscendConfig:
 
         use_sparse = model_uses_sfa_sparse(vllm_config.model_config)
 
+        self.activation_peak_debug = additional_config.get("activation_peak_debug", False)
+        if not isinstance(self.activation_peak_debug, bool):
+            raise ValueError(
+                "activation_peak_debug must be a boolean, got "
+                f"{type(self.activation_peak_debug).__name__}: {self.activation_peak_debug}"
+            )
+        self.activation_peak_debug_rank = additional_config.get("activation_peak_debug_rank", 0)
+        if isinstance(self.activation_peak_debug_rank, bool) or not isinstance(self.activation_peak_debug_rank, int):
+            raise ValueError(
+                "activation_peak_debug_rank must be an integer, got "
+                f"{type(self.activation_peak_debug_rank).__name__}: {self.activation_peak_debug_rank}"
+            )
+        if self.activation_peak_debug_rank < -1:
+            raise ValueError(
+                "activation_peak_debug_rank must be -1 (all ranks) or a non-negative rank, got "
+                f"{self.activation_peak_debug_rank}"
+            )
+        if self.activation_peak_debug and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("activation_peak_debug requires eager mode; set enforce_eager=true.")
+        if self.activation_peak_debug:
+            logger.warning_once(
+                "Activation peak debugging is enabled for profile_run on rank %s. "
+                "NPU synchronization will make startup profiling slower.",
+                "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
+            )
+
         enable_ffn_chunking = additional_config.get("enable_ffn_chunking", False)
         if not isinstance(enable_ffn_chunking, bool):
             raise ValueError(
@@ -896,8 +922,7 @@ class AscendConfig:
         ffn_chunk_size = additional_config.get("ffn_chunk_size", 4096)
         if isinstance(ffn_chunk_size, bool) or not isinstance(ffn_chunk_size, int):
             raise ValueError(
-                "ffn_chunk_size must be an integer, got "
-                f"{type(ffn_chunk_size).__name__}: {ffn_chunk_size}"
+                f"ffn_chunk_size must be an integer, got {type(ffn_chunk_size).__name__}: {ffn_chunk_size}"
             )
         self.ffn_chunk_size = ffn_chunk_size
         if self.ffn_chunk_size <= 0:

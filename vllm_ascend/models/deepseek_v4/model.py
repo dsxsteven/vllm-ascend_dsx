@@ -26,6 +26,7 @@
 import math
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from itertools import islice
 
 import torch
@@ -77,6 +78,7 @@ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
+from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.models.common.ops.sequence_parallel import (
@@ -728,6 +730,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.activation_peak_debug = bool(getattr(get_ascend_config(), "activation_peak_debug", False))
+        self.activation_peak_phase = "mtp" if is_draft_layer else "target"
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
@@ -760,30 +764,57 @@ class DeepseekV4DecoderLayer(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        residual = hidden_states.clone()
-        full_num_tokens = positions.shape[0]
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        hidden_states = self.input_layernorm(hidden_states)
+        activation_peak_active = self.activation_peak_debug and is_activation_peak_profiling()
+        if activation_peak_active:
+            phase = self.activation_peak_phase
+            num_tokens = hidden_states.shape[0]
+            attention_peak_context = record_activation_peak(
+                f"{phase}_attention",
+                f"{phase}.layer.{self.layer_idx}.attention",
+                layer_idx=self.layer_idx,
+                num_tokens=num_tokens,
+            )
+        else:
+            phase = "target"
+            num_tokens = hidden_states.shape[0]
+            attention_peak_context = nullcontext()
 
-        if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
-            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        with attention_peak_context:
+            residual = hidden_states.clone()
+            full_num_tokens = positions.shape[0]
+            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+            hidden_states = self.input_layernorm(hidden_states)
 
-        attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
-        hidden_states = self.self_attn(**attn_kwargs)
+            if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
-        if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
-            hidden_states = sp_reduce_scatter(hidden_states)
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
+            hidden_states = self.self_attn(**attn_kwargs)
 
-        residual = hidden_states.clone()
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        hidden_states, hidden_states_fp32 = self.rms_norm_cast(hidden_states)
-        hidden_states = self.mlp(
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
+            if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
+                hidden_states = sp_reduce_scatter(hidden_states)
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+
+        moe_peak_context = (
+            record_activation_peak(
+                f"{phase}_moe",
+                f"{phase}.layer.{self.layer_idx}.moe",
+                layer_idx=self.layer_idx,
+                num_tokens=num_tokens,
+            )
+            if activation_peak_active
+            else nullcontext()
         )
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        with moe_peak_context:
+            residual = hidden_states.clone()
+            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+            hidden_states, hidden_states_fp32 = self.rms_norm_cast(hidden_states)
+            hidden_states = self.mlp(
+                hidden_states,
+                input_ids=input_ids,
+                hidden_states_fp32=hidden_states_fp32,
+            )
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
 
