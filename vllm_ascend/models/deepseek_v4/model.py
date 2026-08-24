@@ -381,6 +381,8 @@ class DeepseekV4MoE(nn.Module):
             n_shared_experts=config.n_shared_experts if self.is_fusion_moe_shared_experts_enabled else 0,
             hash_indices_table=self.gate.tid2eid,
         )
+        self.activation_peak_debug = bool(getattr(get_ascend_config(), "activation_peak_debug", False))
+        self.activation_peak_phase = "mtp" if is_draft_layer else "target"
 
     def forward(
         self,
@@ -396,23 +398,63 @@ class DeepseekV4MoE(nn.Module):
         if hidden_states_fp32 is not None:
             hidden_states_fp32 = hidden_states_fp32.view(-1, hidden_dim)
 
+        mtp_peak_active = (
+            self.activation_peak_debug
+            and self.activation_peak_phase == "mtp"
+            and is_activation_peak_profiling()
+        )
+
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoEFactory class
             router_input = hidden_states if hidden_states_fp32 is None else hidden_states_fp32
-            fused_moe_out = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_input,
-                input_ids=input_ids,
+            experts_context = (
+                record_activation_peak(
+                    "mtp_moe_experts",
+                    f"mtp.layer.{self.layer_idx}.moe.experts_with_internal_router",
+                    layer_idx=self.layer_idx,
+                    num_tokens=hidden_states.shape[0],
+                )
+                if mtp_peak_active
+                else nullcontext()
             )
+            with experts_context:
+                fused_moe_out = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_input,
+                    input_ids=input_ids,
+                )
         else:
             # router_logits: (num_tokens, n_experts)
             router_input = hidden_states.float() if hidden_states_fp32 is None else hidden_states_fp32
-            router_logits = F.linear(router_input, self.gate.weight)
-            fused_moe_out = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
+            router_context = (
+                record_activation_peak(
+                    "mtp_moe_router_logits",
+                    f"mtp.layer.{self.layer_idx}.moe.router_logits",
+                    layer_idx=self.layer_idx,
+                    num_tokens=hidden_states.shape[0],
+                )
+                if mtp_peak_active
+                else nullcontext()
             )
+            with router_context:
+                router_logits = F.linear(router_input, self.gate.weight)
+
+            experts_context = (
+                record_activation_peak(
+                    "mtp_moe_experts",
+                    f"mtp.layer.{self.layer_idx}.moe.experts",
+                    layer_idx=self.layer_idx,
+                    num_tokens=hidden_states.shape[0],
+                )
+                if mtp_peak_active
+                else nullcontext()
+            )
+            with experts_context:
+                fused_moe_out = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
         if fused_moe_out_is_tuple:
@@ -806,15 +848,55 @@ class DeepseekV4DecoderLayer(nn.Module):
             else nullcontext()
         )
         with moe_peak_context:
-            residual = hidden_states.clone()
-            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-            hidden_states, hidden_states_fp32 = self.rms_norm_cast(hidden_states)
-            hidden_states = self.mlp(
-                hidden_states,
-                input_ids=input_ids,
-                hidden_states_fp32=hidden_states_fp32,
+            ffn_hc_pre_context = (
+                record_activation_peak(
+                    "mtp_ffn_hc_pre",
+                    f"mtp.layer.{self.layer_idx}.ffn.hc_pre",
+                    layer_idx=self.layer_idx,
+                    num_tokens=num_tokens,
+                )
+                if activation_peak_active and phase == "mtp"
+                else nullcontext()
             )
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            with ffn_hc_pre_context:
+                residual = hidden_states.clone()
+                hidden_states, post, comb = self.hc_pre(
+                    hidden_states,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                )
+                hidden_states, hidden_states_fp32 = self.rms_norm_cast(hidden_states)
+
+            moe_core_context = (
+                record_activation_peak(
+                    "mtp_moe_core",
+                    f"mtp.layer.{self.layer_idx}.moe.core",
+                    layer_idx=self.layer_idx,
+                    num_tokens=num_tokens,
+                )
+                if activation_peak_active and phase == "mtp"
+                else nullcontext()
+            )
+            with moe_core_context:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    input_ids=input_ids,
+                    hidden_states_fp32=hidden_states_fp32,
+                )
+
+            ffn_hc_post_context = (
+                record_activation_peak(
+                    "mtp_ffn_hc_post",
+                    f"mtp.layer.{self.layer_idx}.ffn.hc_post",
+                    layer_idx=self.layer_idx,
+                    num_tokens=num_tokens,
+                )
+                if activation_peak_active and phase == "mtp"
+                else nullcontext()
+            )
+            with ffn_hc_post_context:
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
 

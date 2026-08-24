@@ -23,7 +23,12 @@ import torch
 from vllm.distributed import get_dp_group
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
-from vllm_ascend.activation_memory import is_activation_peak_profiling, log_ffn_chunk_decision
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    log_ffn_chunk_decision,
+    log_mtp_moe_chunk_detail,
+    record_mtp_moe_substage,
+)
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -227,10 +232,15 @@ class MoECommMethod(ABC):
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
 
-        token_dispatch_input = build_token_dispatch_input(
-            fused_experts_input=fused_experts_input,
-        )
-        token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+        with record_mtp_moe_substage(
+            "dispatch",
+            "moe.dispatch",
+            num_tokens=fused_experts_input.hidden_states.shape[0],
+        ):
+            token_dispatch_input = build_token_dispatch_input(
+                fused_experts_input=fused_experts_input,
+            )
+            token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
@@ -248,16 +258,26 @@ class MoECommMethod(ABC):
                 supported=chunking_supported,
             )
 
-        if self.enable_ffn_chunking:
-            mlp_output, before_gmm2_evt = self._apply_mlp_with_optional_chunking(mlp_compute_input, quant_method)
-        else:
-            mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+        with record_mtp_moe_substage(
+            "expert_ffn",
+            "moe.expert_ffn",
+            num_tokens=mlp_compute_input.hidden_states.shape[0],
+        ):
+            if self.enable_ffn_chunking:
+                mlp_output, before_gmm2_evt = self._apply_mlp_with_optional_chunking(mlp_compute_input, quant_method)
+            else:
+                mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
 
         before_combine_evt = torch.npu.current_stream().record_event()
-        routed_out = self.token_dispatcher.token_combine(
-            hidden_states=mlp_output,
-            combine_metadata=token_dispatch_output.combine_metadata,
-        )
+        with record_mtp_moe_substage(
+            "combine",
+            "moe.combine",
+            num_tokens=mlp_output.shape[0],
+        ):
+            routed_out = self.token_dispatcher.token_combine(
+                hidden_states=mlp_output,
+                combine_metadata=token_dispatch_output.combine_metadata,
+            )
 
         return FusedExpertsResult(
             routed_out=routed_out,
@@ -451,44 +471,74 @@ class AlltoAllCommImpl(MoECommMethod):
         before_gmm2_evt = None
         before_combine_evt = None
 
-        for start, end in ranges:
-            chunk_input = slice_fused_experts_input_along_tokens(fused_experts_input, start, end)
-            # NOTE: unlike 0.23.0, the log2phy remap already happened upstream
-            # in AscendMoERunner.apply_routed_experts, so chunk_input.topk_ids
-            # is already physical expert ids.
-            token_dispatch_input = build_token_dispatch_input(
-                fused_experts_input=chunk_input,
-            )
-            token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+        for chunk_idx, (start, end) in enumerate(ranges):
+            with record_mtp_moe_substage(
+                "chunk",
+                f"moe.chunk.{chunk_idx + 1}_of_{num_chunks}",
+                num_tokens=end - start,
+            ):
+                chunk_input = slice_fused_experts_input_along_tokens(fused_experts_input, start, end)
+                # NOTE: unlike 0.23.0, the log2phy remap already happened
+                # upstream in AscendMoERunner.apply_routed_experts, so
+                # chunk_input.topk_ids is already physical expert ids.
+                with record_mtp_moe_substage(
+                    "dispatch",
+                    f"moe.chunk.{chunk_idx + 1}.dispatch",
+                    num_tokens=end - start,
+                ):
+                    token_dispatch_input = build_token_dispatch_input(
+                        fused_experts_input=chunk_input,
+                    )
+                    token_dispatch_output = self.token_dispatcher.token_dispatch(
+                        token_dispatch_input=token_dispatch_input
+                    )
 
-            chunk_group_list = token_dispatch_output.group_list
-            group_list_type = token_dispatch_output.group_list_type
+                log_mtp_moe_chunk_detail(
+                    chunk_idx=chunk_idx,
+                    num_chunks=num_chunks,
+                    raw_start=start,
+                    raw_end=end,
+                    dispatched_tokens=token_dispatch_output.hidden_states.shape[0],
+                )
 
-            mlp_compute_input = build_mlp_compute_input(
-                fused_experts_input=chunk_input,
-                token_dispatch_output=token_dispatch_output,
-                moe_config=self.moe_config,
-            )
-            mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
-            before_combine_evt = torch.npu.current_stream().record_event()
-            chunk_routed_out = self.token_dispatcher.token_combine(
-                hidden_states=mlp_output,
-                combine_metadata=token_dispatch_output.combine_metadata,
-            )
-            del mlp_output, token_dispatch_output
+                chunk_group_list = token_dispatch_output.group_list
+                group_list_type = token_dispatch_output.group_list_type
 
-            if routed_out is None:
-                routed_out = chunk_routed_out.new_empty((num_tokens, *chunk_routed_out.shape[1:]))
-            routed_out[start:end].copy_(chunk_routed_out)
-            del chunk_routed_out
+                mlp_compute_input = build_mlp_compute_input(
+                    fused_experts_input=chunk_input,
+                    token_dispatch_output=token_dispatch_output,
+                    moe_config=self.moe_config,
+                )
+                with record_mtp_moe_substage(
+                    "expert_ffn",
+                    f"moe.chunk.{chunk_idx + 1}.expert_ffn",
+                    num_tokens=mlp_compute_input.hidden_states.shape[0],
+                ):
+                    mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+                before_combine_evt = torch.npu.current_stream().record_event()
+                with record_mtp_moe_substage(
+                    "combine",
+                    f"moe.chunk.{chunk_idx + 1}.combine",
+                    num_tokens=mlp_output.shape[0],
+                ):
+                    chunk_routed_out = self.token_dispatcher.token_combine(
+                        hidden_states=mlp_output,
+                        combine_metadata=token_dispatch_output.combine_metadata,
+                    )
+                del mlp_output, token_dispatch_output
 
-            if chunk_group_list is not None:
-                # Per-expert token counts are partial per chunk; EPLB heat
-                # collection needs the total across the whole batch.
-                if expert_tokens is None:
-                    expert_tokens = chunk_group_list.clone()
-                else:
-                    expert_tokens += chunk_group_list
+                if routed_out is None:
+                    routed_out = chunk_routed_out.new_empty((num_tokens, *chunk_routed_out.shape[1:]))
+                routed_out[start:end].copy_(chunk_routed_out)
+                del chunk_routed_out
+
+                if chunk_group_list is not None:
+                    # Per-expert token counts are partial per chunk; EPLB heat
+                    # collection needs the total across the whole batch.
+                    if expert_tokens is None:
+                        expert_tokens = chunk_group_list.clone()
+                    else:
+                        expert_tokens += chunk_group_list
 
         assert routed_out is not None
         return FusedExpertsResult(
