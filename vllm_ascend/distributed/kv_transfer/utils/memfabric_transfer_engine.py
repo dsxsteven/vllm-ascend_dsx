@@ -130,12 +130,14 @@ class GlobalMemfabricTE:
             self._role,
             self._device_id,
         )
+        from memfabric_hybrid import TransDataOpType
         ret = raw_engine.initialize(
             store_url,
             hostname,
             self._role,
             self._device_id,
             store_server_role=MEMFABRIC_ROLE_PREFILL,
+            data_op_type=TransDataOpType.DEVICE_URMA
         )
         if ret != 0:
             raise RuntimeError(
