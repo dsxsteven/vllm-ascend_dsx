@@ -479,7 +479,15 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             topk_ids = torch.cat([topk_ids, shared_expert_ids], dim=1)
             topk_weights = torch.cat([topk_weights, shared_expert_weights], dim=1)
 
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        # Routing weights must stay in a floating compute dtype: when the EP
+        # prepare step (e.g. flashcomm1 + dsa_cp with W4A8/W8A8) has already
+        # quantized hidden_states (float8_e4m3fn / int8 / fp4), propagating that
+        # dtype to topk_weights breaks downstream ops (e.g. `topk_weights * mask`
+        # in the token dispatcher: fp8 x bool promotion is unsupported).
+        if hidden_states.dtype in (torch.float32, torch.float16, torch.bfloat16):
+            topk_weights = topk_weights.to(hidden_states.dtype)
+        else:
+            topk_weights = topk_weights.to(torch.float32)
         # This is a naive implementation for experts load balance so as to
         # avoid accumulating too much tokens on a single rank. It is only
         # activated when doing profile runs.
