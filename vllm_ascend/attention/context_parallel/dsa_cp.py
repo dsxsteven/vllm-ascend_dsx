@@ -1393,18 +1393,50 @@ class AscendDSACPImpl(DSAAttentionImpl):
                     attn_metadata=attn_metadata,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                 )
-                compress_topk_idxs = self._indexer_select_topk(
-                    x=hidden_states_local,
-                    qr=qr_local,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                    cos=local_cos,
-                    sin=local_sin,
-                    actual_seq_lengths_query=local_seq_lengths_query,
-                    actual_seq_lengths_key=local_seq_lengths_key,
-                    qr_pertoken_scale=qr_pertoken_scale_local,
-                )
-
+                if has_prefill:
+                #if False:
+                    seq_len = hidden_states_local.size(0)
+                    chunk_size = 1024
+                    #print("chunk_size:", chunk_size)
+                    num_chunks = (seq_len + chunk_size - 1) // chunk_size
+                    
+                    compress_topk_idxs_list = []
+                    for i in range(num_chunks):
+                        start = i * chunk_size
+                        end = min((i + 1) * chunk_size, seq_len)
+                        x_chunk = hidden_states_local[start:end, :]
+                        qr_chunk = qr_local[start:end, :]
+                        cos_chunk = local_cos[start:end, :, :, :]
+                        sin_chunk = local_sin[start:end, :, :, :]
+                        qr_pertoken_scale_chunk = qr_pertoken_scale_local[start:end] if qr_pertoken_scale_local is not None else None
+                        compress_topk_idxs_chunk = self._indexer_select_topk(
+                            x=x_chunk,
+                            qr=qr_chunk,
+                            kv_cache=kv_cache,
+                            attn_metadata=attn_metadata,
+                            cos=cos_chunk,
+                            sin=sin_chunk,
+                            actual_seq_lengths_query=local_seq_lengths_query,
+                            actual_seq_lengths_key=local_seq_lengths_key,
+                            qr_pertoken_scale=qr_pertoken_scale_chunk,
+                        )
+                        #print("compress_topk_idxs_chunk.shape:", compress_topk_idxs_chunk.shape)
+                        compress_topk_idxs_list.append(compress_topk_idxs_chunk)
+        
+                    compress_topk_idxs = torch.cat(compress_topk_idxs_list, dim=0)
+                    #print("compress_topk_idxs.shape:", compress_topk_idxs.shape)
+                else:
+                    compress_topk_idxs = self._indexer_select_topk(
+                        x=hidden_states_local,
+                        qr=qr_local,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        cos=local_cos,
+                        sin=local_sin,
+                        actual_seq_lengths_query=local_seq_lengths_query,
+                        actual_seq_lengths_key=local_seq_lengths_key,
+                        qr_pertoken_scale=qr_pertoken_scale_local,
+                    )
             coff = 2 if self.compressor_overlap else 1
             compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
                 compressor_attn_metadata.req_metadata,
