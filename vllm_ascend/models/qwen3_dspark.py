@@ -1,4 +1,6 @@
+import logging
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -8,6 +10,44 @@ from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 
 from vllm_ascend.models.llama_eagle3 import get_rotation_matrix, get_rotation_path
+
+logger = logging.getLogger(__name__)
+
+
+def get_dspark_rotation_path(vllm_config: VllmConfig) -> Path | None:
+    """Resolve the target QuaRot matrix used to align DSpark FC weights.
+
+    Some ModelSlim checkpoints mark ``is_rot_used`` but leave the newer
+    ``optional.quarot.rotation_map`` metadata empty.  Those checkpoints still
+    publish the matrix at the legacy ``optional/quarot.safetensors`` path.
+    Silently returning ``None`` in that case leaves the draft model in the
+    unrotated basis and collapses speculative-token acceptance.
+    """
+    rotation_path = get_rotation_path(vllm_config)
+    if rotation_path is not None:
+        return rotation_path
+
+    quant_config = vllm_config.quant_config
+    quant_description = getattr(quant_config, "quant_description", {}) if quant_config is not None else {}
+    if not quant_description.get("is_rot_used", False):
+        return None
+
+    target_model_path = Path(vllm_config.model_config.model)
+    legacy_rotation_path = target_model_path / "optional" / "quarot.safetensors"
+    if not legacy_rotation_path.is_file():
+        raise FileNotFoundError(
+            "The target checkpoint declares is_rot_used=true, but DSpark "
+            "could not find optional.quarot.rotation_map.global_rotation "
+            f"metadata or the legacy matrix at {legacy_rotation_path}."
+        )
+
+    logger.warning(
+        "The target checkpoint declares is_rot_used=true but does not provide "
+        "optional.quarot.rotation_map.global_rotation metadata; using the "
+        "legacy DSpark QuaRot matrix at %s.",
+        legacy_rotation_path,
+    )
+    return legacy_rotation_path
 
 
 # Process the first linear weight with rotation matrix, if the target model uses rotary quantization
@@ -65,7 +105,7 @@ class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
                 config=config,
                 prefix=maybe_prefix(model_prefix, "confidence_head"),
             )
-        self.rotation_path = get_rotation_path(vllm_config) if vllm_config.quant_config is not None else None
+        self.rotation_path = get_dspark_rotation_path(vllm_config)
 
     @staticmethod
     def _get_confidence_relative_name(
