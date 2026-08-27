@@ -828,13 +828,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.ctkv_scale = torch.tensor([1], dtype=act_dtype, device=device)
         self.q_nope_scale = torch.tensor([1], dtype=act_dtype, device=device)
 
-        # On KV consumers (decode-only) MLAPO uses the transformed weights built above;
-        # the original fused_qkv_a_proj/q_proj weights and quant params are no longer
-        # referenced, so drop them to save memory.
+        # On plain KV consumers (and MTP consumers) MLAPO uses the transformed
+        # weights built above, so the original projections can be released.
+        # Other speculative methods, including DSpark, can route a multi-token
+        # verification batch through the native/ChunkedPrefill fallback. Keep
+        # the original weights for those methods; otherwise the linear layer
+        # returns an empty last dimension and the Q/KV split fails.
+        speculative_config = self.vllm_config.speculative_config
+        native_fallback_needed = speculative_config is not None and speculative_config.method != "mtp"
         if (
             self.vllm_config.kv_transfer_config is not None
             and self.vllm_config.kv_transfer_config.is_kv_consumer
             and self.vllm_config.scheduler_config.max_num_batched_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
+            and not native_fallback_needed
         ):
             self.fused_qkv_a_proj.weight = None
             self.fused_qkv_a_proj.deq_scale = None
