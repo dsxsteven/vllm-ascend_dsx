@@ -30,6 +30,7 @@ import torch
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
@@ -678,6 +679,27 @@ class TestDSparkGraphDummyRun(_DSparkProposerTestBase):
         assert common_metadata.num_reqs == 3
         assert common_metadata.query_start_loc_cpu.tolist() == [0, 3, 6, 8]
         assert proposer._runnable.call_args.kwargs["num_input_tokens"] == 8
+
+
+class TestDSparkDSAGraphBuffers:
+    def test_swa_indices_keep_address_and_refresh_contents(self):
+        builder = AscendDSAMetadataBuilder.__new__(AscendDSAMetadataBuilder)
+        builder.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=2)
+        )
+        builder.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+        builder.dspark_swa_indices_buffer = None
+
+        first = torch.arange(24, dtype=torch.int32).reshape(2, 1, 12)
+        stable_first = builder._persist_dspark_swa_indices(first)
+        first_address = stable_first.data_ptr()
+
+        second = torch.full((2, 1, 12), 17, dtype=torch.int32)
+        stable_second = builder._persist_dspark_swa_indices(second)
+
+        assert stable_second.data_ptr() == first_address
+        assert torch.equal(stable_second, second)
+        assert stable_first.data_ptr() == stable_second.data_ptr()
 
 
 class TestDSparkGraphRuntimePadding(_DSparkProposerTestBase):
