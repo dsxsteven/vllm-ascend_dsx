@@ -378,6 +378,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # Note(qcs): we use two dimension slot_mapping for kvcache with shape
         # [block_nums, block_size, head_num, head_dim]
         self.slot_mapping = torch.zeros(self.slot_mapping_shape, dtype=torch.int32, device=self.device)
+        # DSA graph replay does not rebind operator inputs in
+        # ``update_graph_params``. DSpark's per-token SWA indices must therefore
+        # keep the same device address across capture and every replay.
+        self.dspark_swa_indices_buffer: torch.Tensor | None = None
 
     def _init_hadamard(self) -> None:
         if AscendDSAMetadataBuilder.hadamard is not None:
@@ -782,6 +786,33 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             hadamard=None,
         )
 
+    def _persist_dspark_swa_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Copy runtime DSpark indices into graph-stable device storage."""
+        assert self.speculative_config is not None
+        max_rows = self.vllm_config.scheduler_config.max_num_seqs * (
+            self.speculative_config.num_speculative_tokens + 1
+        )
+        if self.dspark_swa_indices_buffer is None:
+            self.dspark_swa_indices_buffer = torch.empty(
+                (max_rows, *indices.shape[1:]),
+                dtype=indices.dtype,
+                device=indices.device,
+            )
+        else:
+            assert self.dspark_swa_indices_buffer.shape[1:] == indices.shape[1:], (
+                "DSpark SWA index width changed after graph capture: "
+                f"buffer={self.dspark_swa_indices_buffer.shape[1:]}, "
+                f"runtime={indices.shape[1:]}"
+            )
+        if indices.shape[0] > max_rows:
+            raise RuntimeError(
+                "DSpark SWA indices exceed the persistent graph buffer: "
+                f"rows={indices.shape[0]}, capacity={max_rows}"
+            )
+        stable_indices = self.dspark_swa_indices_buffer[: indices.shape[0]]
+        stable_indices.copy_(indices)
+        return stable_indices
+
     def build_req_metadata_for_drafting(
         self,
         draft_index: int,
@@ -818,7 +849,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 seq_lens,
                 self.num_actual_tokens,
             )
-            dspark_swa_indices = dspark_swa_indices[: self.num_actual_tokens]
+            dspark_swa_indices = self._persist_dspark_swa_indices(
+                dspark_swa_indices[: self.num_actual_tokens]
+            )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
 
         cu_seqlens_ori_kv = (
