@@ -484,10 +484,10 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         # quantized hidden_states (float8_e4m3fn / int8 / fp4), propagating that
         # dtype to topk_weights breaks downstream ops (e.g. `topk_weights * mask`
         # in the token dispatcher: fp8 x bool promotion is unsupported).
-        if hidden_states.dtype in (torch.float32, torch.float16, torch.bfloat16):
-            topk_weights = topk_weights.to(hidden_states.dtype)
-        else:
-            topk_weights = topk_weights.to(torch.float32)
+        #if hidden_states.dtype in (torch.float32, torch.float16, torch.bfloat16):
+        #    topk_weights = topk_weights.to(hidden_states.dtype)
+        #else:
+        #    topk_weights = topk_weights.to(torch.float32)
         # This is a naive implementation for experts load balance so as to
         # avoid accumulating too much tokens on a single rank. It is only
         # activated when doing profile runs.
