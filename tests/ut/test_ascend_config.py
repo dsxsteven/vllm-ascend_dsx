@@ -610,9 +610,11 @@ class TestAscendConfig(TestBase):
         model_config.hf_text_config = sparse_hf_config
         test_vllm_config.model_config = model_config
         invalid_configs = [
-            ({"enable_ffn_chunking": 1}, "must be a boolean"),
-            ({"ffn_chunk_size": True}, "must be an integer"),
-            ({"ffn_chunk_size": 1.5}, "must be an integer"),
+            # NOTE: 0.30.0 AscendConfig uses pydantic lax coercion by design
+            # (1 -> True, True -> 1), so the 0.23.0 strict bool/int type
+            # errors no longer apply. Fractional floats and non-positive
+            # sizes still fail.
+            ({"ffn_chunk_size": 1.5}, "Input should be a valid integer"),
             ({"ffn_chunk_size": 0}, "must be positive"),
         ]
 
