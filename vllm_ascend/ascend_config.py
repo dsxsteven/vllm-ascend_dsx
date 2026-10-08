@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import math
 import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -576,6 +577,18 @@ class AscendConfig:
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
+    enable_ffn_chunking: bool = False
+    """Opt in to MoE FFN token chunking (routed experts split into token
+    chunks to cap activation memory). Explicit opt-in only; requires
+    ``enforce_eager=true``. See ``ffn_chunk_size``."""
+    ffn_chunk_size: int = 4096
+    """Token chunk size for MoE FFN chunking when ``enable_ffn_chunking`` is
+    set. Must be positive."""
+    activation_peak_debug: bool = False
+    """Enable scoped activation-memory peak logging (MTP/attention/MoE)
+    during profile_run. Requires ``enforce_eager=true``."""
+    activation_peak_debug_rank: int = 0
+    """Rank that logs activation peaks: -1 for all ranks, else one rank id."""
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -882,22 +895,9 @@ class AscendConfig:
             if self.pd_tp_ratio == 0:
                 raise AssertionError("Only support P node tp size lagger then D node tp size")
 
-        from vllm_ascend.utils import model_uses_sfa_sparse
-
-        use_sparse = model_uses_sfa_sparse(vllm_config.model_config)
-
-        self.activation_peak_debug = additional_config.get("activation_peak_debug", False)
-        if not isinstance(self.activation_peak_debug, bool):
-            raise ValueError(
-                "activation_peak_debug must be a boolean, got "
-                f"{type(self.activation_peak_debug).__name__}: {self.activation_peak_debug}"
-            )
-        self.activation_peak_debug_rank = additional_config.get("activation_peak_debug_rank", 0)
-        if isinstance(self.activation_peak_debug_rank, bool) or not isinstance(self.activation_peak_debug_rank, int):
-            raise ValueError(
-                "activation_peak_debug_rank must be an integer, got "
-                f"{type(self.activation_peak_debug_rank).__name__}: {self.activation_peak_debug_rank}"
-            )
+        # ---- ported FFN chunking / activation-peak-debug cross-config checks ----
+        # (type validation of these fields is handled by pydantic at
+        #  construction time; only cross-config checks live here)
         if self.activation_peak_debug_rank < -1:
             raise ValueError(
                 "activation_peak_debug_rank must be -1 (all ranks) or a non-negative rank, got "
@@ -912,26 +912,11 @@ class AscendConfig:
                 "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
             )
 
-        enable_ffn_chunking = additional_config.get("enable_ffn_chunking", False)
-        if not isinstance(enable_ffn_chunking, bool):
-            raise ValueError(
-                "enable_ffn_chunking must be a boolean, got "
-                f"{type(enable_ffn_chunking).__name__}: {enable_ffn_chunking}"
-            )
-
-        ffn_chunk_size = additional_config.get("ffn_chunk_size", 4096)
-        if isinstance(ffn_chunk_size, bool) or not isinstance(ffn_chunk_size, int):
-            raise ValueError(
-                f"ffn_chunk_size must be an integer, got {type(ffn_chunk_size).__name__}: {ffn_chunk_size}"
-            )
-        self.ffn_chunk_size = ffn_chunk_size
         if self.ffn_chunk_size <= 0:
             raise ValueError(f"ffn_chunk_size must be positive, got {self.ffn_chunk_size}")
-
         # FFN chunking is an explicit opt-in. Do not infer the Attention
         # implementation from model-specific fields such as ``index_topk`` or
         # ``compress_ratios``; deployment configuration owns that decision.
-        self.enable_ffn_chunking = enable_ffn_chunking
         if self.enable_ffn_chunking and not getattr(
             vllm_config.model_config, "enforce_eager", False
         ):

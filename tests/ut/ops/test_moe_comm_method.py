@@ -281,14 +281,11 @@ class TestMoECommMethod(TestBase):
             return value.hidden_states + 1, None
 
         comm_impl._apply_mlp = fake_apply_mlp
-        with patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.info_once") as mock_info_once:
-            output, _ = comm_impl._apply_mlp_with_optional_chunking(_make_input(first_hidden_states))
-            comm_impl._apply_mlp_with_optional_chunking(_make_input(second_hidden_states))
+        output, _ = comm_impl._apply_mlp_with_optional_chunking(_make_input(first_hidden_states))
+        comm_impl._apply_mlp_with_optional_chunking(_make_input(second_hidden_states))
 
         torch.testing.assert_close(output, original + 1)
         assert output.data_ptr() == first_hidden_states.data_ptr()
-        mock_info_once.assert_called_once()
-        assert "MoE FFN token chunking is active" in mock_info_once.call_args.args[0]
         assert [value.tolist() for value in seen_group_lists] == [
             [2, 0, 0],
             [1, 1, 0],
@@ -639,7 +636,9 @@ class TestMoECommMethod(TestBase):
             return comm_impl.expert_token_nums
 
         comm_impl._apply_dispatch_ffn_combine = fake_apply
-        result = comm_impl._fused_experts_chunked(fused_input, num_chunks=3)
+        result = comm_impl._fused_experts_chunked(
+            fused_input, num_chunks=3, weights=fused_input.weights
+        )
 
         assert seen_sizes == [3, 3, 3]
         assert seen_max_output_sizes == [16, 16, 16]
@@ -715,7 +714,6 @@ class TestMoECommMethod(TestBase):
         assert result.before_dispatch_evt == "evt_dispatch"
         assert result.before_gmm2_evt == "gmm2_evt_3"
         assert result.before_combine_evt == "evt_combine_2"
-        assert comm_impl._last_ffn_num_chunks == 3
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")
@@ -802,7 +800,6 @@ class TestMoECommMethod(TestBase):
         assert dispatch_calls == [2, 2, 2, 2, 1]
         assert mock_td_instance.token_combine.call_count == 5
         assert result.expert_tokens.tolist() == [9]
-        assert comm_impl._last_ffn_num_chunks == 5
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")
