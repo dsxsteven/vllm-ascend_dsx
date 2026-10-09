@@ -750,7 +750,6 @@ class TestMoECommMethod(TestBase):
         mock_get_forward_context.return_value = MagicMock()
         self.mock_ascend_config.enable_ffn_chunking = True
         self.mock_ascend_config.ffn_chunk_size = 2
-        self.mock_ascend_config.dp_allreduce_on_npu = False
         self.moe_config.dp_size = 2
 
         dispatch_calls = []
@@ -810,7 +809,6 @@ class TestMoECommMethod(TestBase):
         mock_get_forward_context.return_value = MagicMock()
         self.mock_ascend_config.enable_ffn_chunking = True
         self.mock_ascend_config.ffn_chunk_size = 2
-        self.mock_ascend_config.dp_allreduce_on_npu = False
         mock_token_dispatcher.return_value = MagicMock()
         self.moe_config.dp_size = 2
 

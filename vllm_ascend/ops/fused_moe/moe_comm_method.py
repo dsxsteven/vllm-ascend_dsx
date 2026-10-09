@@ -112,13 +112,12 @@ def _e2e_uniform_chunk_count(num_tokens: int, chunk_size: int, moe_config: Fused
     dp_group = get_dp_group()
     if dp_group.world_size <= 1:
         return k_local if k_local > 1 else 0
-    if get_ascend_config().dp_allreduce_on_npu:
-        payload = torch.tensor([k_local, -num_tokens], dtype=torch.int64, device="npu")
-        group = dp_group.device_group
-    else:
-        payload = torch.tensor([k_local, -num_tokens], dtype=torch.int64)
-        group = dp_group.cpu_group
-    torch.distributed.all_reduce(payload, op=torch.distributed.ReduceOp.MAX, group=group)
+    # NOTE: 0.23.0 had an additional_config switch (dp_allreduce_on_npu) to
+    # all-reduce on the NPU device group; 0.30.0 removed that attribute and
+    # always synchronizes DP metadata on the CPU group (see
+    # NPUModelRunner._sync_metadata_across_dp), so follow that convention.
+    payload = torch.tensor([k_local, -num_tokens], dtype=torch.int64)
+    torch.distributed.all_reduce(payload, op=torch.distributed.ReduceOp.MAX, group=dp_group.cpu_group)
     k_uniform = min(int(payload[0].item()), int(-payload[1].item()))
     return k_uniform if k_uniform > 1 else 0
 
