@@ -4271,7 +4271,6 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     device_metadata_executor=active_device_metadata_executor,
                     has_sinks=self._has_sinks,
-                    input_ids=input_ids,
                     eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
                 ):
                     if not is_graph_capturing and self.ascend_config.enable_force_eplb \
