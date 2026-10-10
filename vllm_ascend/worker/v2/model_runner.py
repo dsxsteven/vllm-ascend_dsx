@@ -49,6 +49,12 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
+from vllm_ascend.activation_memory import (
+    ActivationPeakProfiler,
+    activation_peak_profile_session,
+    record_activation_buffer,
+    record_activation_peak,
+)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
@@ -513,16 +519,32 @@ class NPUModelRunner(GPUModelRunner):
         forward_failed = True
         with dp_coordination_context:
             try:
-                output = super().execute_model(
-                    scheduler_output,
-                    intermediate_tensors=intermediate_tensors,
-                    dummy_run=dummy_run,
-                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                    is_profile=is_profile,
-                    context_len=context_len,
-                    valid_dummy_state_slots=valid_dummy_state_slots,
+                # Activation-peak scope for dummy/profile runs. It must stay a
+                # SIBLING of the speculator propose (which runs later, inside
+                # upstream _dummy_run but outside execute_model): child-scope
+                # peaks propagate to parents, so wrapping _dummy_run instead
+                # would fold the draft peak into the target-model total. The
+                # dummy_run gate keeps the serving hot path at zero cost.
+                target_scope = (
+                    record_activation_peak(
+                        "target_model",
+                        "target.model_forward",
+                        num_tokens=scheduler_output.total_num_scheduled_tokens,
+                    )
+                    if dummy_run
+                    else nullcontext()
                 )
-                forward_failed = False
+                with target_scope:
+                    output = super().execute_model(
+                        scheduler_output,
+                        intermediate_tensors=intermediate_tensors,
+                        dummy_run=dummy_run,
+                        skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                        is_profile=is_profile,
+                        context_len=context_len,
+                        valid_dummy_state_slots=valid_dummy_state_slots,
+                    )
+                    forward_failed = False
             finally:
                 finish_execution = getattr(self.model_state, "finish_execution", None)
                 if finish_execution is not None:
@@ -584,23 +606,79 @@ class NPUModelRunner(GPUModelRunner):
         """Override GPUModelRunner.profile_run for Ascend NPUs.
         When running moe models, we need an extra dummy run with mc2_tokens_capacity tokens to reserve
         necessary HCCL buffer for the MC2 operator before standard `profile_run`. Additionally, we set
-        override_mrv2_in_profile_run to True to force moe load to be balanced when executing `profile_run`
+        override_mrv2_in_profile_run to True to force moe load to be balanced when executing `profile_run`.
+
+        The whole profile (sparse-buffer reservation, MC2-capacity dummy run and
+        the upstream profile_run) is wrapped in an activation-peak session when
+        ascend_config.activation_peak_debug is set (mirrors the MRV1 runner):
+        model/MoE-level scopes then record their peaks, and
+        self.activation_peak_profile_result feeds NPUWorker's KV-sizing peak
+        compensation (worker determine_available_memory).
         """
-        sparse_cfg = self.ascend_config.sparse_kv_offload_config
-        if sparse_cfg.enabled:
-            allocate_kv_offload_topk_profile_buffers(self.get_kv_cache_spec(), self.vllm_config, sparse_cfg)
-        mc2_tokens_capacity = get_mc2_tokens_capacity()
-        with override_mrv2_in_profile_run(True):
-            if (
-                mc2_tokens_capacity is not None
-                and self.max_num_tokens > mc2_tokens_capacity
-                and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
-                in {MoECommType.MC2, MoECommType.FUSED_MC2}
-            ):
-                # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
-                with disable_compilation(self.get_model()):
-                    self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
-            super().profile_run()
+        activation_debug = bool(getattr(self.ascend_config, "activation_peak_debug", False))
+        configured_rank = int(getattr(self.ascend_config, "activation_peak_debug_rank", 0))
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        activation_debug = activation_debug and (configured_rank == -1 or configured_rank == global_rank)
+        self.activation_peak_profile_result: ActivationPeakProfiler | None = None
+        with activation_peak_profile_session(enabled=activation_debug, rank=global_rank) as profiler:
+            if profiler is not None:
+                speculative_method = getattr(self.speculative_config, "method", "none")
+                logger.warning(
+                    "[ACTIVATION_PEAK][CONFIG] rank=%s ffn_chunking=%s "
+                    "ffn_chunk_size=%s speculative_method=%s max_num_tokens=%s",
+                    global_rank,
+                    bool(getattr(self.ascend_config, "enable_ffn_chunking", False)),
+                    int(getattr(self.ascend_config, "ffn_chunk_size", 0)),
+                    speculative_method,
+                    self.max_num_tokens,
+                )
+                mtp_hidden_buffer = getattr(
+                    self.get_model(),
+                    "get_mtp_target_hidden_states",
+                    lambda: None,
+                )()
+                if mtp_hidden_buffer is not None:
+                    record_activation_buffer(
+                        "mtp_hidden_buffer",
+                        "target.pre_hc_head_residual",
+                        mtp_hidden_buffer.numel() * mtp_hidden_buffer.element_size(),
+                    )
+                elif speculative_method == "mtp":
+                    record_activation_buffer(
+                        "mtp_hidden_buffer",
+                        "target.pre_hc_head_residual.not_allocated",
+                        0,
+                    )
+
+            sparse_cfg = self.ascend_config.sparse_kv_offload_config
+            if sparse_cfg.enabled:
+                allocate_kv_offload_topk_profile_buffers(self.get_kv_cache_spec(), self.vllm_config, sparse_cfg)
+            mc2_tokens_capacity = get_mc2_tokens_capacity()
+            with override_mrv2_in_profile_run(True):
+                if (
+                    mc2_tokens_capacity is not None
+                    and self.max_num_tokens > mc2_tokens_capacity
+                    and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
+                    in {MoECommType.MC2, MoECommType.FUSED_MC2}
+                ):
+                    # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
+                    with disable_compilation(self.get_model()):
+                        self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
+                super().profile_run()
+        self.activation_peak_profile_result = profiler
+
+    @torch.inference_mode()
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        with record_activation_peak(
+            "target_head",
+            "target.lm_head",
+            num_tokens=hidden_states.shape[0],
+        ):
+            super()._dummy_sampler_run(hidden_states)
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
