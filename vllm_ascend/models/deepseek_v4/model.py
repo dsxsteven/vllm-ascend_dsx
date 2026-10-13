@@ -1005,13 +1005,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    # Chunk size for hc_head token chunking. Every op inside hc_head is
+    # per-token independent (flatten→norm→gating→weighted-sum), so splitting
+    # along the token axis is mathematically exact. The chunk bounds the fp32
+    # working set that previously materialized at full batch: with hc_mult*H =
+    # 16384 fp32 elements per token, an unchunked N=22000 forward held
+    # x_flat + x_norm + prod + y ≈ 3*N*64KiB + N*16KiB simultaneously,
+    # which dominated the activation peak (measured 4469 MiB of 5243 total).
+    HC_HEAD_CHUNK = 4096
+
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        """Compress (N, hc_mult, H) back to (N, H) with learned per-slot gates.
+
+        The computation is token-independent, so it runs in HC_HEAD_CHUNK-
+        sized token slices: each slice's fp32 intermediates (x_flat, x_norm,
+        gating product) are freed before the next slice materializes, keeping
+        the transient peak proportional to the chunk size instead of N.
+        """
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(1).float()
-        x_norm = self.hc_norm(x)
-        mixes = torch.nn.functional.linear(x_norm, hc_fn)
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+        num_tokens = shape[0]
+        chunk = min(self.HC_HEAD_CHUNK, num_tokens)
+        # Pre-allocate the fp32 result once; each chunk writes its slice.
+        y = torch.empty(num_tokens, shape[2], dtype=torch.float32, device=x.device)
+        for start in range(0, num_tokens, chunk):
+            end = min(start + chunk, num_tokens)
+            xc = x[start:end]
+            xc_shape = xc.size()
+            xc_flat = xc.flatten(1).float()
+            xc_norm = self.hc_norm(xc_flat)
+            mixes = torch.nn.functional.linear(xc_norm, hc_fn)
+            pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+            y[start:end] = torch.sum(pre.unsqueeze(-1) * xc_flat.view(xc_shape), dim=1)
         return y.to(dtype)
 
     def forward(
