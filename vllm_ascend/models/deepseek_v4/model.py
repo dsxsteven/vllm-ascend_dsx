@@ -1026,7 +1026,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                with record_activation_peak(
+                    "target_embedding", "target.embed_tokens",
+                    num_tokens=input_ids.shape[0],
+                ):
+                    hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -1060,15 +1064,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             llama_4_scaling = None
 
         if pp_group.is_first_rank:
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
+            with record_activation_peak(
+                "target_hc_expand", "target.hc_repeat_expand",
+                num_tokens=hidden_states.shape[0],
+            ):
+                hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-                llama_4_scaling,
-                input_ids=input_ids,
-            )
+            with record_activation_peak(
+                "target_layer", f"target.layer_total.{layer.layer_idx}",
+                layer_idx=layer.layer_idx, num_tokens=hidden_states.shape[0],
+            ):
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    llama_4_scaling,
+                    input_ids=input_ids,
+                )
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_state = hidden_states.mean(dim=1)
                 if self.use_sequence_parallel_moe:
@@ -1092,7 +1104,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
 
         if self.use_sequence_parallel_moe:
-            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
+            with record_activation_peak(
+                "target_sp_gather", "target.tail_sp_all_gather",
+                num_tokens=hidden_states.shape[0],
+            ):
+                hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         if self._needs_mtp_hidden_states:
@@ -1105,9 +1121,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+        with record_activation_peak(
+            "target_tail", "target.hc_head_and_norm",
+            num_tokens=hidden_states.shape[0],
+        ):
+            hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
 
-        hidden_states = self.norm(hidden_states)
+            hidden_states = self.norm(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

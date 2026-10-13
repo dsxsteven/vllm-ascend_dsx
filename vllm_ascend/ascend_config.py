@@ -585,8 +585,13 @@ class AscendConfig:
     """Token chunk size for MoE FFN chunking when ``enable_ffn_chunking`` is
     set. Must be positive."""
     activation_peak_debug: bool = False
-    """Enable scoped activation-memory peak logging (MTP/attention/MoE)
-    during profile_run. Requires ``enforce_eager=true``."""
+    """Enable scoped activation-memory peak logging during profile_run.
+    Covers the full forward (embedding/hc-expand/layer/attention/MoE/
+    sp-gather/tail hc_head+norm/lm_head + MTP draft scopes). Set
+    ``activation_peak_debug_rank`` to 0 (rank 0) or -1 (all ranks).
+    Interpretation guide: see the ``vllm_ascend.activation_memory`` module
+    docstring (log levels, SUMMARY share-of-target_model semantics, caveats).
+    Requires ``enforce_eager=true``."""
     activation_peak_debug_rank: int = 0
     """Rank that logs activation peaks: -1 for all ranks, else one rank id."""
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
