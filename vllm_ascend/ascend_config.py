@@ -584,6 +584,15 @@ class AscendConfig:
     ffn_chunk_size: int = 4096
     """Token chunk size for MoE FFN chunking when ``enable_ffn_chunking`` is
     set. Must be positive."""
+    enable_attention_chunking: bool = False
+    """Opt in to DSA-CP sparse attention token chunking for prefill steps
+    (q prolog + KV/indexer/compressor cache writes + top-k + sparse
+    attention run per token chunk to cap attention activation memory).
+    Requires ``enforce_eager=true`` and ``enable_dsa_cp=true`` (compress
+    ratio 4 models only). See ``attention_chunk_size``."""
+    attention_chunk_size: int = 8192
+    """Global token chunk size for attention chunking when
+    ``enable_attention_chunking`` is set. Must be positive."""
     activation_peak_debug: bool = False
     """Enable scoped activation-memory peak logging during profile_run.
     Covers the full forward (embedding/hc-expand/layer/attention/MoE/
@@ -966,6 +975,29 @@ class AscendConfig:
                 "[fused_moe] MoE FFN token chunking is enabled for routed experts: "
                 "chunk_size=%s.",
                 self.ffn_chunk_size,
+            )
+
+        if self.attention_chunk_size <= 0:
+            raise ValueError(f"attention_chunk_size must be positive, got {self.attention_chunk_size}")
+        # Attention chunking re-runs the DSA-CP stage list per token chunk with
+        # chunk-local metadata, so it shares the FFN chunking eager-mode scope.
+        if self.enable_attention_chunking and not getattr(
+            vllm_config.model_config, "enforce_eager", False
+        ):
+            raise ValueError(
+                "enable_attention_chunking currently requires eager mode; "
+                "set enforce_eager=true."
+            )
+        if self.enable_attention_chunking:
+            if not self.enable_dsa_cp:
+                logger.warning_once(
+                    "enable_attention_chunking only takes effect on the DSA-CP attention "
+                    "path (enable_dsa_cp=true, compress ratio 4); it is ignored otherwise."
+                )
+            logger.info_once(
+                "[attention] DSA-CP attention token chunking is enabled for prefill: "
+                "chunk_size=%s.",
+                self.attention_chunk_size,
             )
 
         # enable_kv_nz preconditions
