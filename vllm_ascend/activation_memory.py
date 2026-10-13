@@ -1,7 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Scoped activation-memory peak diagnostics for Ascend profile runs."""
+"""Scoped activation-memory peak diagnostics for Ascend profile runs.
+
+Usage
+-----
+Set in ``--additional-config`` (requires ``enforce_eager``)::
+
+    "activation_peak_debug": true,          # master switch
+    "activation_peak_debug_rank": 0         # 0 = rank 0 only, -1 = all ranks
+
+During ``profile_run`` the runner wraps the whole forward in
+``activation_peak_profile_session``; every ``record_activation_peak`` scope in
+the model/runner path then measures its own transient peak. Each scope entry
+takes a checkpoint (synchronize + propagate current peak to parent scopes),
+records ``memory_allocated`` as baseline, resets the allocator peak tracker,
+and on exit reads the in-scope peak — so nested scopes never lose their peak
+to a child's reset and every parent's peak bounds its children's.
+
+Scope coverage (full forward)
+----------------------------
+- ``target_model``      : whole model forward (KV-pricing denominator)
+- ``target_embedding``  : embed_input_ids
+- ``target_hc_expand``  : hc repeat-expand to (N, hc_mult, H)
+- ``target_layer``      : per-layer total (− attention − moe = unattributed)
+- ``target_attention``  : per-layer self_attn (+SP gather/scatter)
+- ``target_moe``        : per-layer mlp (router+shared+routed)
+- ``target_sp_gather``  : tail sp_all_gather back to full tokens
+- ``target_tail``       : hc_head + final norm
+- ``target_head``       : lm_head (dummy sampler)
+- ``mtp_*``             : draft-side scopes when speculative decoding is on
+
+Reading the logs
+----------------
+``[ACTIVATION_PEAK][CONFIG]``  session parameters (ffn_chunking, chunk_size …)
+``[ACTIVATION_PEAK][STAGE]``   per scope instance:
+    growth  = in-scope peak − entry baseline  (reducible transient)
+    retained= after − baseline  (positive ⇒ leak / persistent allocation)
+``[ACTIVATION_PEAK][FFN_CHUNK]`` per-MoE-layer chunk decision (applied/reason)
+``[ACTIVATION_PEAK][SUMMARY]``  per category: max growth over all instances —
+    the share of ``target_model.max_growth`` is "who pins the pricing peak".
+``[ACTIVATION_PEAK][VERDICT]`` dominant top-level vs dominant component.
+
+Caveats
+-------
+- Counts only torch-allocator tensors (HCCL/CANN workspaces excluded).
+- Two synchronizes per scope: debug-only; do not use numbers for perf timing.
+- Scopes reset the global peak tracker; NPUWorker compensates KV sizing via
+  ``activation_peak_profile_result`` — keep that assignment if you move the
+  session wrapper.
+"""
 
 from __future__ import annotations
 
