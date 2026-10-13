@@ -1132,6 +1132,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_hidden_states,
             )
 
+        # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        # Runs on the sharded stream when SP is on; the buffer needs the full
+        # token set, so gather for the buffer only (transient, freed after).
+        if self._mtp_hidden_buffer is not None:
+            if self.use_sequence_parallel_moe:
+                h_full = sp_all_gather(hidden_states.flatten(1))[: positions.shape[0]]
+                self._mtp_hidden_buffer[: h_full.shape[0]].copy_(h_full)
+                del h_full
+            else:
+                num_tokens = hidden_states.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+
+        # Run hc_head on the SHARDED input when SP is on (per-token
+        # independent, so sharding is exact). The gather then moves only the
+        # compressed (N, H) output instead of the 4x-larger pre-hc_head
+        # (N, hc_mult*H) tensor: gather volume drops hc_mult-fold.
+        with record_activation_peak(
+            "target_tail", "target.hc_head_and_norm",
+            num_tokens=hidden_states.shape[0],
+        ):
+            hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+
         if self.use_sequence_parallel_moe:
             with record_activation_peak(
                 "target_sp_gather", "target.tail_sp_all_gather",
@@ -1139,17 +1161,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ):
                 hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
 
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        if self._mtp_hidden_buffer is not None:
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
-
         with record_activation_peak(
-            "target_tail", "target.hc_head_and_norm",
+            "target_tail_norm", "target.final_norm",
             num_tokens=hidden_states.shape[0],
         ):
-            hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
-
             hidden_states = self.norm(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
