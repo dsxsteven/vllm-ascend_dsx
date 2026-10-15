@@ -91,6 +91,13 @@ def setup_moe_comm_method(moe_config):
         _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, moe_config)] = AllGatherCommImpl(moe_config)
 
 
+# Cache for _e2e_uniform_chunk_count: key is (num_tokens, chunk_size), value
+# is the uniform chunk count. All layers in a forward pass see the same
+# num_tokens, so the DP allreduce runs once per step instead of per layer.
+_chunk_count_cache: dict[tuple[int, int], int] = {}
+_CHUNK_COUNT_CACHE_MAX = 32
+
+
 def _e2e_uniform_chunk_count(num_tokens: int, chunk_size: int, moe_config: FusedMoEConfig) -> int:
     """Chunk count every rank in the EP group can use (0 disables chunking).
 
@@ -105,21 +112,42 @@ def _e2e_uniform_chunk_count(num_tokens: int, chunk_size: int, moe_config: Fused
     so every rank can produce K non-empty balanced chunks. K == 1 (or an
     idle rank with 0 tokens) disables chunking everywhere, keeping the
     collective call count identical on the fallback path.
+
+    The DP allreduce result is cached per (num_tokens, chunk_size) so that
+    the 43 MoE layers in one forward pass only trigger one collective —
+    the first layer pays the sync cost, the remaining 42 hit the cache.
     """
+    # Only cache when there is a single DP rank — with DP > 1, one rank
+    # hitting the cache would skip the collective while another rank with a
+    # different local num_tokens still participates, deadlocking the group.
+    is_single_dp = getattr(moe_config, "dp_size", 1) <= 1
+    cache_key = (num_tokens, chunk_size)
+    if is_single_dp:
+        cached = _chunk_count_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     k_local = max(1, (num_tokens + chunk_size - 1) // chunk_size)
-    if getattr(moe_config, "dp_size", 1) <= 1:
-        return k_local if k_local > 1 else 0
-    dp_group = get_dp_group()
-    if dp_group.world_size <= 1:
-        return k_local if k_local > 1 else 0
-    # NOTE: 0.23.0 had an additional_config switch (dp_allreduce_on_npu) to
-    # all-reduce on the NPU device group; 0.30.0 removed that attribute and
-    # always synchronizes DP metadata on the CPU group (see
-    # NPUModelRunner._sync_metadata_across_dp), so follow that convention.
-    payload = torch.tensor([k_local, -num_tokens], dtype=torch.int64)
-    torch.distributed.all_reduce(payload, op=torch.distributed.ReduceOp.MAX, group=dp_group.cpu_group)
-    k_uniform = min(int(payload[0].item()), int(-payload[1].item()))
-    return k_uniform if k_uniform > 1 else 0
+    if is_single_dp:
+        result = k_local if k_local > 1 else 0
+    else:
+        dp_group = get_dp_group()
+        if dp_group.world_size <= 1:
+            result = k_local if k_local > 1 else 0
+        else:
+            # NOTE: 0.30.0 always synchronizes DP metadata on the CPU group
+            # (see NPUModelRunner._sync_metadata_across_dp).
+            payload = torch.tensor([k_local, -num_tokens], dtype=torch.int64)
+            torch.distributed.all_reduce(payload, op=torch.distributed.ReduceOp.MAX, group=dp_group.cpu_group)
+            k_uniform = min(int(payload[0].item()), int(-payload[1].item()))
+            result = k_uniform if k_uniform > 1 else 0
+
+    if is_single_dp:
+        # Bounded LRU-style: clear when too many entries accumulate.
+        if len(_chunk_count_cache) >= _CHUNK_COUNT_CACHE_MAX:
+            _chunk_count_cache.clear()
+        _chunk_count_cache[cache_key] = result
+    return result
 
 
 @dataclass
