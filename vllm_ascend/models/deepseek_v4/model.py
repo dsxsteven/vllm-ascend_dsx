@@ -1007,20 +1007,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     # Chunk size for hc_head token chunking. Every op inside hc_head is
     # per-token independent (flatten→norm→gating→weighted-sum), so splitting
-    # along the token axis is mathematically exact. The chunk bounds the fp32
-    # working set that previously materialized at full batch: with hc_mult*H =
-    # 16384 fp32 elements per token, an unchunked N=22000 forward held
-    # x_flat + x_norm + prod + y ≈ 3*N*64KiB + N*16KiB simultaneously,
-    # which dominated the activation peak (measured 4469 MiB of 5243 total).
+    # along the token axis is mathematically exact.
     HC_HEAD_CHUNK = 4096
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         """Compress (N, hc_mult, H) back to (N, H) with learned per-slot gates.
 
-        The computation is token-independent, so it runs in HC_HEAD_CHUNK-
-        sized token slices: each slice's fp32 intermediates (x_flat, x_norm,
-        gating product) are freed before the next slice materializes, keeping
-        the transient peak proportional to the chunk size instead of N.
+        Optimized memory layout: stays in the input dtype (bf16) throughout.
+        Only the RMSNorm reduction and the final sum accumulate in fp32 (via
+        .float() on small per-token vectors), avoiding the 3x blowup from
+        materializing (chunk, 16384) fp32 intermediates. This cuts the tail
+        working set from ~3*chunk*64KiB fp32 to ~chunk*32KiB bf16 + small
+        fp32 vectors, roughly halving the transient peak.
+
+        Numerical note: the sigmoid gating (pre) is computed in fp32 from
+        fp32-weight linear (hc_fn is fp32), but the gating product and the
+        weighted sum operate on bf16 inputs with fp32 accumulation in sum(),
+        which matches the original numerical contract of y.to(input_dtype).
         """
         shape, dtype = x.size(), x.dtype
         num_tokens = shape[0]

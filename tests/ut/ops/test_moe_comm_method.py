@@ -29,6 +29,8 @@ from vllm_ascend.quantization.methods.base import QuantType
 
 class TestMoECommMethod(TestBase):
     def setUp(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _chunk_count_cache
+        _chunk_count_cache.clear()
         self.mock_ascend_config = MagicMock()
         self.mock_ascend_config.ascend_fusion_config.fusion_ops_gmmswigluquant = False
         self.mock_ascend_config.enable_fused_mc2 = False
