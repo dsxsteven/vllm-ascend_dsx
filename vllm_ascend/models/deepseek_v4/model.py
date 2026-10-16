@@ -1013,33 +1013,66 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         """Compress (N, hc_mult, H) back to (N, H) with learned per-slot gates.
 
-        Optimized memory layout: stays in the input dtype (bf16) throughout.
-        Only the RMSNorm reduction and the final sum accumulate in fp32 (via
-        .float() on small per-token vectors), avoiding the 3x blowup from
-        materializing (chunk, 16384) fp32 intermediates. This cuts the tail
-        working set from ~3*chunk*64KiB fp32 to ~chunk*32KiB bf16 + small
-        fp32 vectors, roughly halving the transient peak.
+        bf16-compatible memory optimization:
+        - Stays in the input dtype (bf16) for all large intermediates
+        (flatten view, gating product, output y) — halves the transient peak.
+        - Only small per-token vectors (norm reduction, sigmoid gates) use
+        fp32, which Python frees immediately after each expression.
+        - The weight is pre-cast to bf16 ONCE per model (cached), not per
+        call — per-call .to() creates a cross-stream copy that deadlocks
+        with ffn chunk's multi-stream dispatch/combine events (NPU error
+        50734: AclrtSynchronizeStreamWithTimeout on copy_stream).
+        - An explicit stream sync before the loop drains any pending side
+        streams from the ffn chunk path, preventing stream dependency cycles.
 
-        Numerical note: the sigmoid gating (pre) is computed in fp32 from
-        fp32-weight linear (hc_fn is fp32), but the gating product and the
-        weighted sum operate on bf16 inputs with fp32 accumulation in sum(),
-        which matches the original numerical contract of y.to(input_dtype).
+        Numerical contract: sigmoid gates and norm reduction accumulate in
+        fp32; the gating product and weighted sum operate on bf16 inputs
+        with fp32 accumulation in sum(). Matches the original y.to(input_dtype).
         """
+        # Safety: drain ffn chunk's side streams before touching hc_head —
+        # prevents stream dependency cycles with dispatch/combine events.
+        torch.npu.current_stream().synchronize()
+
         shape, dtype = x.size(), x.dtype
         num_tokens = shape[0]
         chunk = min(self.HC_HEAD_CHUNK, num_tokens)
-        # Pre-allocate the fp32 result once; each chunk writes its slice.
-        y = torch.empty(num_tokens, shape[2], dtype=torch.float32, device=x.device)
+
+        # Pre-cast weight to input dtype ONCE — per-call .to() creates a
+        # cross-stream copy that deadlocks with ffn chunk's multi-stream ops.
+        if getattr(self, "_hc_fn_cast", None) is None or self._hc_fn_cast.dtype != dtype:
+            self._hc_fn_cast = hc_fn.to(dtype)
+
+        y = torch.empty(num_tokens, shape[2], dtype=dtype, device=x.device)
+
         for start in range(0, num_tokens, chunk):
             end = min(start + chunk, num_tokens)
             xc = x[start:end]
             xc_shape = xc.size()
-            xc_flat = xc.flatten(1).float()
-            xc_norm = self.hc_norm(xc_flat)
-            mixes = torch.nn.functional.linear(xc_norm, hc_fn)
-            pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-            y[start:end] = torch.sum(pre.unsqueeze(-1) * xc_flat.view(xc_shape), dim=1)
-        return y.to(dtype)
+            # bf16 view of the input (no copy, no fp32 blowup)
+            xc_flat = xc.flatten(1)
+
+            # RMSNorm: fp32 reduction on small per-token vectors, then
+            # rescale the bf16 tensor. The fp32 intermediates (chunk, 16384)
+            # exist only within this expression — freed before the next line.
+            inv_norm = torch.rsqrt(
+                xc_flat.float().square().mean(-1, keepdim=True) + self.norm_eps
+            )
+
+            # Linear with pre-cast bf16 weight — no per-call .to(), no
+            # cross-stream copy, no dtype mismatch.
+            mixes = torch.nn.functional.linear(
+                xc_flat * inv_norm.to(dtype), self._hc_fn_cast
+            )
+
+            # Sigmoid gating in fp32 (tiny (chunk, hc_mult) output).
+            pre = torch.sigmoid(mixes.float() * hc_scale + hc_base) + self.hc_eps
+
+            # Weighted sum: (chunk, hc_mult, 1) bf16 * (chunk, hc_mult, H) bf16
+            # → sum(dim=1) with fp32 accumulation → writes bf16 into y.
+            y[start:end] = torch.sum(
+                pre.to(dtype).unsqueeze(-1) * xc_flat.view(xc_shape), dim=1
+            )
+        return y
 
     def forward(
         self,
