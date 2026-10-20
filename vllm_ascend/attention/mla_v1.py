@@ -1,4 +1,5 @@
 from copy import copy
+from contextlib import nullcontext
 from dataclasses import dataclass
 from math import lcm
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
@@ -30,6 +31,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import (
@@ -3460,6 +3462,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
         o_proj_input = torch.zeros(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
+        # Per-subpart activation-peak scopes. No-op (nullcontext) outside the
+        # debug profile_run, so the hot path pays nothing. MLA forward splits
+        # cleanly into q/kv projection (preprocess), the attention core
+        # (decode/prefill), and the output projection.
+        profiling = is_activation_peak_profiling()
+        scope_label = layer_name
+
         gate = None
         if self.use_output_gate:
             assert self.g_proj is not None
@@ -3499,63 +3508,85 @@ class AscendMLAImpl(MLAAttentionImpl):
             and not self.enable_kv_nz
             and attn_metadata.num_decode_tokens > 0
         )
-        if use_prolog_v3_strided_cache:
-            decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_prolog_v3(
-                hidden_states, kv_cache, attn_metadata
-            )
-        elif self._uses_strided_kv_adapter() and any(not cache.is_contiguous() for cache in kv_cache):
-            decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
-                layer_name, hidden_states, kv_cache, attn_metadata
-            )
-        elif (
-            (self.fa_quant_layer or self.enable_mlapo)
-            and (not fused_mla_cache or self._can_use_flashmla_mlapo(kv_cache, attn_metadata))
-            and (not decode_requires_current_kv or can_use_dcp_prolog)
-            # The fused prolog writes only local KV, while sharded decode must gather it.
-            and not self.is_pcp_decode_sharded
-            and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
-            and attn_metadata.num_prefills == 0
+        with (
+            record_activation_peak(
+                "target_attn_qkv_proj", f"{scope_label}.attn.qkv_proj",
+                num_tokens=num_actual_tokens,
+            ) if profiling else nullcontext()
         ):
-            wait_for_kv_layer_from_connector(layer_name)
-            if self.layerwise_kv_cache_hook is not None:
-                self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
-            decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_only_decode(
-                hidden_states, kv_cache, attn_metadata
-            )
-        else:
-            decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
-                layer_name, hidden_states, kv_cache, attn_metadata
-            )
-        if decode_preprocess_res is not None:
-            # MLA Preprocess for decoding
-            if attn_metadata.external_flashmla is not None:
-                output_decode = self._forward_external_flashmla(
-                    decode_preprocess_res, external_flash_cache, attn_metadata
+            if use_prolog_v3_strided_cache:
+                decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_prolog_v3(
+                    hidden_states, kv_cache, attn_metadata
+                )
+            elif self._uses_strided_kv_adapter() and any(not cache.is_contiguous() for cache in kv_cache):
+                decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
+                    layer_name, hidden_states, kv_cache, attn_metadata
+                )
+            elif (
+                (self.fa_quant_layer or self.enable_mlapo)
+                and (not fused_mla_cache or self._can_use_flashmla_mlapo(kv_cache, attn_metadata))
+                and (not decode_requires_current_kv or can_use_dcp_prolog)
+                # The fused prolog writes only local KV, while sharded decode must gather it.
+                and not self.is_pcp_decode_sharded
+                and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
+                and attn_metadata.num_prefills == 0
+            ):
+                wait_for_kv_layer_from_connector(layer_name)
+                if self.layerwise_kv_cache_hook is not None:
+                    self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
+                decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_only_decode(
+                    hidden_states, kv_cache, attn_metadata
                 )
             else:
-                output_decode = self._forward_decode(decode_preprocess_res, kv_cache[0].shape[1], attn_metadata)
+                decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
+                    layer_name, hidden_states, kv_cache, attn_metadata
+                )
+        with (
+            record_activation_peak(
+                "target_attn_sfa", f"{scope_label}.attn.sfa",
+                num_tokens=num_actual_tokens,
+            ) if profiling else nullcontext()
+        ):
+            if decode_preprocess_res is not None:
+                # MLA Preprocess for decoding
+                if attn_metadata.external_flashmla is not None:
+                    output_decode = self._forward_external_flashmla(
+                        decode_preprocess_res, external_flash_cache, attn_metadata
+                    )
+                else:
+                    output_decode = self._forward_decode(decode_preprocess_res, kv_cache[0].shape[1], attn_metadata)
 
-            o_proj_input[:num_decode_tokens] = output_decode
+                o_proj_input[:num_decode_tokens] = output_decode
 
-        if prefill_preprocess_res is not None:
-            # FIX: aicore move should be also placed on the comm stream in dbo,
-            # otherwise it may affect the accuracy
-            # TODO: use an elegant way to overlap
-            output_prefill = self._forward_prefill(
-                prefill_preprocess_res.q_nope,
-                prefill_preprocess_res.q_pe,
-                prefill_preprocess_res.k_nope,
-                prefill_preprocess_res.k_pe,
-                prefill_preprocess_res.value,
-                kv_cache,
-                attn_metadata,
-            )
+            if prefill_preprocess_res is not None:
+                # FIX: aicore move should be also placed on the comm stream in dbo,
+                # otherwise it may affect the accuracy
+                # TODO: use an elegant way to overlap
+                output_prefill = self._forward_prefill(
+                    prefill_preprocess_res.q_nope,
+                    prefill_preprocess_res.q_pe,
+                    prefill_preprocess_res.k_nope,
+                    prefill_preprocess_res.k_pe,
+                    prefill_preprocess_res.value,
+                    kv_cache,
+                    attn_metadata,
+                )
 
-            o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
+                o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         if gate is not None:
             o_proj_input.mul_(torch.sigmoid(gate))
         # O proj
-        output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        o_proj_ctx = (
+            record_activation_peak(
+                "target_attn_o_proj",
+                f"{scope_label}.attn.o_proj",
+                num_tokens=num_actual_tokens,
+            )
+            if profiling
+            else nullcontext()
+        )
+        with o_proj_ctx:
+            output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

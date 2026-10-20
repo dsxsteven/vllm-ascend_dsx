@@ -9,6 +9,7 @@ moving cache or scheduler knowledge back into the model.
 """
 
 from contextlib import contextmanager
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -28,6 +29,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
+from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.core.kv_cache_interface import (
@@ -698,22 +700,54 @@ class AscendDSAV41Impl:
             output.zero_()
             return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
-        q, qr, prepared_indexer = self._prepare_inputs_and_caches(
-            attn, hidden_states, metadata, forward_context.attn_metadata
-        )
+        profiling = is_activation_peak_profiling()
+        layer_idx = getattr(attn, "layer_idx", None)
+        scope_label = self.prefix
+        num_tokens_for_scope = metadata.swa.num_actual_tokens
+        with (
+            record_activation_peak(
+                "target_attn_qkv_proj", f"{scope_label}.attn.prepare_inputs_and_caches",
+                layer_idx=layer_idx,
+                num_tokens=num_tokens_for_scope,
+            ) if profiling else nullcontext()
+        ):
+            q, qr, prepared_indexer = self._prepare_inputs_and_caches(
+                attn, hidden_states, metadata, forward_context.attn_metadata
+            )
         num_tokens = metadata.swa.num_actual_tokens
         if num_tokens:
             positions = metadata.positions[:num_tokens]
             cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
-            compressed_indices = self._select_sparse_indices(
-                attn, hidden_states, qr, positions, cos, sin, metadata, prepared_indexer
-            )
-            attention_output = self._forward_attention(attn, q, metadata, compressed_indices)
-            AscendDSAV41Impl._apply_rotary(attn, attention_output, cos, sin, inverse=True)
+            with (
+                record_activation_peak(
+                    "target_attn_indexer", f"{scope_label}.attn.indexer",
+                    layer_idx=layer_idx,
+                    num_tokens=num_tokens_for_scope,
+                ) if profiling else nullcontext()
+            ):
+                compressed_indices = self._select_sparse_indices(
+                    attn, hidden_states, qr, positions, cos, sin, metadata, prepared_indexer
+                )
+            with (
+                record_activation_peak(
+                    "target_attn_sfa", f"{scope_label}.attn.sfa",
+                    layer_idx=layer_idx,
+                    num_tokens=num_tokens_for_scope,
+                ) if profiling else nullcontext()
+            ):
+                attention_output = self._forward_attention(attn, q, metadata, compressed_indices)
+                AscendDSAV41Impl._apply_rotary(attn, attention_output, cos, sin, inverse=True)
         else:
             heads = attn.n_heads if getattr(attn, "enable_dsa_cp", False) else attn.n_local_heads
             attention_output = hidden_states.new_empty((0, heads, attn.head_dim))
-        self._project_output(attn, attention_output, hidden_states, metadata, projected=output)
+        with (
+            record_activation_peak(
+                "target_attn_o_proj", f"{scope_label}.attn.o_proj",
+                layer_idx=layer_idx,
+                num_tokens=num_tokens_for_scope,
+            ) if profiling else nullcontext()
+        ):
+            self._project_output(attn, attention_output, hidden_states, metadata, projected=output)
         return output
 
 
