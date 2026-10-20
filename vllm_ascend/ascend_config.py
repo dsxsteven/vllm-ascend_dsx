@@ -594,6 +594,23 @@ class AscendConfig:
     Requires ``enforce_eager=true``."""
     activation_peak_debug_rank: int = 0
     """Rank that logs activation peaks: -1 for all ranks, else one rank id."""
+    serving_peak_debug: bool = False
+    """Per-step scoped activation-peak logging during real request serving
+    (not just profile_run). Wraps each serving forward in a throwaway
+    ``ActivationPeakProfiler`` so the existing ``record_activation_peak``
+    scopes in the model/attention/MoE paths fire, then logs the step's
+    absolute memory peak, the scope that pins it (moe/attn_sfa/
+    attn_qkv_proj/...) and each attention sub-component's absolute peak
+    plus its growth delta. Requires ``enforce_eager=true`` (the per-scope
+    ``torch.npu.synchronize()`` + ``reset_peak_memory_stats`` would break
+    ACL graph capture/replay) and is debug-only: two synchronizes per
+    scope per step add real serving latency. When this is on it replaces
+    the lightweight ``[SERVING_MEMORY][STEP]`` log (which can't coexist
+    with the per-step peak reset). Set ``serving_peak_debug_rank`` to
+    0 (rank 0) or -1 (all ranks) to select which ranks log."""
+    serving_peak_debug_rank: int = 0
+    """Rank that logs serving per-step peaks: -1 for all ranks, else one
+    rank id."""
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -915,6 +932,21 @@ class AscendConfig:
                 "Activation peak debugging is enabled for profile_run on rank %s. "
                 "NPU synchronization will make startup profiling slower.",
                 "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
+            )
+
+        if self.serving_peak_debug_rank < -1:
+            raise ValueError(
+                "serving_peak_debug_rank must be -1 (all ranks) or a non-negative rank, got "
+                f"{self.serving_peak_debug_rank}"
+            )
+        if self.serving_peak_debug and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("serving_peak_debug requires eager mode; set enforce_eager=true.")
+        if self.serving_peak_debug:
+            logger.warning_once(
+                "Serving per-step peak debugging is enabled on rank %s. "
+                "Two NPU synchronizes per scope per step will add real serving latency; "
+                "the lightweight [SERVING_MEMORY][STEP] log is suppressed in this mode.",
+                "all" if self.serving_peak_debug_rank == -1 else self.serving_peak_debug_rank,
             )
 
         if self.ffn_chunk_size <= 0:

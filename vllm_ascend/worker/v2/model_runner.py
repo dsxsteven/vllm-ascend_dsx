@@ -54,6 +54,8 @@ from vllm_ascend.activation_memory import (
     activation_peak_profile_session,
     record_activation_buffer,
     record_activation_peak,
+    serving_memory_log_step,
+    serving_peak_step_session,
 )
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -142,6 +144,22 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        # Serving-path memory logging reuses the activation_peak_debug flag,
+        # cached once to avoid re-reading config per execute_model step.
+        self.activation_peak_debug = bool(
+            getattr(self.ascend_config, "activation_peak_debug", False)
+        )
+        self.activation_peak_debug_rank = int(
+            getattr(self.ascend_config, "activation_peak_debug_rank", 0)
+        )
+        # Per-step scoped serving-peak mode (heavier; replaces the lightweight
+        # STEP log when on). Cached once to avoid re-reading config per step.
+        self.serving_peak_debug = bool(
+            getattr(self.ascend_config, "serving_peak_debug", False)
+        )
+        self.serving_peak_debug_rank = int(
+            getattr(self.ascend_config, "serving_peak_debug_rank", 0)
+        )
         self.sparse_kv_offload_manager = None
         self.kvpp = KVPPRuntime()
         # Adaptive verification uses this flag to apply FIA-specific query
@@ -535,16 +553,52 @@ class NPUModelRunner(GPUModelRunner):
                     else nullcontext()
                 )
                 with target_scope:
-                    output = super().execute_model(
-                        scheduler_output,
-                        intermediate_tensors=intermediate_tensors,
-                        dummy_run=dummy_run,
-                        skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                        is_profile=is_profile,
-                        context_len=context_len,
-                        valid_dummy_state_slots=valid_dummy_state_slots,
+                    # Per-step scoped serving-peak mode (serving_peak_debug) is
+                    # mutually exclusive with the lightweight STEP log: the
+                    # per-step peak reset clobbers the cumulative run_peak the
+                    # STEP log reports. Only one of the two runs for a real
+                    # serving step (never for dummy/profile).
+                    serving_peak_rank = (
+                        self._serving_peak_rank()
+                        if not dummy_run and not is_profile
+                        else None
                     )
+                    serving_mem_rank = (
+                        self._serving_memory_rank()
+                        if not dummy_run and not is_profile and serving_peak_rank is None
+                        else None
+                    )
+                    peak_scope = (
+                        serving_peak_step_session(
+                            rank=serving_peak_rank,
+                            num_tokens=scheduler_output.total_num_scheduled_tokens,
+                        )
+                        if serving_peak_rank is not None
+                        else nullcontext()
+                    )
+                    if serving_mem_rank is not None:
+                        serving_memory_log_step(
+                            rank=serving_mem_rank,
+                            phase="pre_forward",
+                            num_tokens=scheduler_output.total_num_scheduled_tokens,
+                        )
+                    with peak_scope:
+                        output = super().execute_model(
+                            scheduler_output,
+                            intermediate_tensors=intermediate_tensors,
+                            dummy_run=dummy_run,
+                            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                            is_profile=is_profile,
+                            context_len=context_len,
+                            valid_dummy_state_slots=valid_dummy_state_slots,
+                        )
                     forward_failed = False
+                    if serving_mem_rank is not None:
+                        serving_memory_log_step(
+                            rank=serving_mem_rank,
+                            phase="post_forward",
+                            num_tokens=scheduler_output.total_num_scheduled_tokens,
+                        )
             finally:
                 finish_execution = getattr(self.model_state, "finish_execution", None)
                 if finish_execution is not None:
@@ -600,6 +654,49 @@ class NPUModelRunner(GPUModelRunner):
             prefix_connector=prefix_store[0] if prefix_store is not None else None,
             prefix_metadata=prefix_store[1] if prefix_store is not None else None,
         )
+
+    def _serving_memory_rank(self) -> int | None:
+        """Return the global rank if serving-path memory logging is on for it.
+
+        Mirrors the rank filter used by profile_run: ``activation_peak_debug``
+        gates the feature, ``activation_peak_debug_rank`` selects which ranks
+        log (0 = rank 0, -1 = all ranks). Returns ``None`` when the feature is
+        off so callers skip the snapshot call entirely (zero per-step cost).
+        """
+        if not getattr(self, "activation_peak_debug", False):
+            return None
+        configured = int(getattr(self, "activation_peak_debug_rank", 0))
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        if configured == -1:
+            return global_rank
+        return global_rank if global_rank == configured else None
+
+    def _serving_peak_rank(self) -> int | None:
+        """Return the global rank if per-step scoped serving-peak logging is on.
+
+        Gated by ``serving_peak_debug``; ``serving_peak_debug_rank`` selects
+        which ranks log (0 = rank 0, -1 = all ranks). Returns ``None`` when the
+        feature is off so callers skip the per-step scope entirely (zero
+        per-step cost). Mutually exclusive with the lightweight STEP log: when
+        this returns a rank, callers should NOT also call
+        ``serving_memory_log_step`` (the per-step peak reset clobbers the
+        cumulative ``run_peak`` the STEP log reports).
+        """
+        if not getattr(self, "serving_peak_debug", False):
+            return None
+        configured = int(getattr(self, "serving_peak_debug_rank", 0))
+        global_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        if configured == -1:
+            return global_rank
+        return global_rank if global_rank == configured else None
 
     @torch.inference_mode()
     def profile_run(self) -> None:

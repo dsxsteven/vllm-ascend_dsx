@@ -126,6 +126,8 @@ from vllm_ascend.activation_memory import (
     activation_peak_profile_session,
     record_activation_buffer,
     record_activation_peak,
+    serving_memory_log_step,
+    serving_peak_step_session,
 )
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
@@ -427,6 +429,24 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        # Serving-path memory logging reuses the activation_peak_debug flag.
+        # Cached once to avoid re-reading the config every execute_model step;
+        # when False the per-step snapshot calls are skipped entirely.
+        self.activation_peak_debug = bool(
+            getattr(self.ascend_config, "activation_peak_debug", False)
+        )
+        self.activation_peak_debug_rank = int(
+            getattr(self.ascend_config, "activation_peak_debug_rank", 0)
+        )
+        # Per-step scoped serving-peak mode (heavier; replaces the lightweight
+        # STEP log when on). Cached once; when False the per-step scope is
+        # skipped entirely.
+        self.serving_peak_debug = bool(
+            getattr(self.ascend_config, "serving_peak_debug", False)
+        )
+        self.serving_peak_debug_rank = int(
+            getattr(self.ascend_config, "serving_peak_debug_rank", 0)
+        )
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         self.kvpp = KVPPRuntime()
@@ -2596,13 +2616,45 @@ class NPUModelRunner(GPUModelRunner):
                         mamba_copy_connector = connector
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
-            self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
-                profiling_chunk_config,
-                execution_start_time,
-            )
+            # Per-step scoped serving-peak mode (serving_peak_debug) is mutually
+            # exclusive with the lightweight STEP log: the per-step peak reset
+            # clobbers the cumulative run_peak the STEP log reports. When the
+            # scoped mode is on, wrap _model_forward in serving_peak_step_session
+            # and skip the pre/post STEP snapshots; otherwise emit the light log.
+            serving_peak_rank = self._serving_peak_rank()
+            if serving_peak_rank is not None:
+                with serving_peak_step_session(
+                    rank=serving_peak_rank,
+                    num_tokens=num_tokens_padded,
+                ):
+                    hidden_states = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                    )
+                    self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
+                        profiling_chunk_config,
+                        execution_start_time,
+                    )
+            else:
+                serving_mem_rank = self._serving_memory_rank()
+                if serving_mem_rank is not None:
+                    serving_memory_log_step(
+                        rank=serving_mem_rank,
+                        phase="pre_forward",
+                        num_tokens=num_tokens_padded,
+                    )
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+                self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
+                    profiling_chunk_config,
+                    execution_start_time,
+                )
+                if serving_mem_rank is not None:
+                    serving_memory_log_step(
+                        rank=serving_mem_rank,
+                        phase="post_forward",
+                        num_tokens=num_tokens_padded,
+                    )
             # Verify every scheduled layer executed its deferred copy.
             if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
                 mamba_copy_connector.finish_mamba_state_copy()
@@ -4319,6 +4371,49 @@ class NPUModelRunner(GPUModelRunner):
                 self.positions.fill_(0)
                 self._dsa_positions_cpu_buf.fill_(0)
             return hidden_states, hidden_states
+
+    def _serving_memory_rank(self) -> int | None:
+        """Return the global rank if serving-path memory logging is on for it.
+
+        Mirrors the rank filter used by profile_run: ``activation_peak_debug``
+        gates the feature, ``activation_peak_debug_rank`` selects which ranks
+        log (0 = rank 0, -1 = all ranks). Returns ``None`` when the feature is
+        off so callers can skip the snapshot call entirely (zero per-step cost).
+        """
+        if not getattr(self, "activation_peak_debug", False):
+            return None
+        configured = int(getattr(self, "activation_peak_debug_rank", 0))
+        global_rank = (
+            dist.get_rank()
+            if dist.is_available() and dist.is_initialized()
+            else 0
+        )
+        if configured == -1:
+            return global_rank
+        return global_rank if global_rank == configured else None
+
+    def _serving_peak_rank(self) -> int | None:
+        """Return the global rank if per-step scoped serving-peak logging is on.
+
+        Gated by ``serving_peak_debug``; ``serving_peak_debug_rank`` selects
+        which ranks log (0 = rank 0, -1 = all ranks). Returns ``None`` when the
+        feature is off so callers skip the per-step scope entirely (zero
+        per-step cost). Mutually exclusive with the lightweight STEP log: when
+        this returns a rank, callers should NOT also call
+        ``serving_memory_log_step`` (the per-step peak reset clobbers the
+        cumulative ``run_peak`` the STEP log reports).
+        """
+        if not getattr(self, "serving_peak_debug", False):
+            return None
+        configured = int(getattr(self, "serving_peak_debug_rank", 0))
+        global_rank = (
+            dist.get_rank()
+            if dist.is_available() and dist.is_initialized()
+            else 0
+        )
+        if configured == -1:
+            return global_rank
+        return global_rank if global_rank == configured else None
 
     @torch.inference_mode()
     def _dummy_sampler_run(

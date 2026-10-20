@@ -11,6 +11,8 @@ from vllm_ascend.activation_memory import (
     record_activation_buffer,
     record_activation_peak,
     record_mtp_moe_substage,
+    serving_memory_log_step,
+    serving_peak_step_session,
 )
 
 
@@ -57,6 +59,12 @@ def test_nested_activation_peak_scopes_preserve_overall_peak():
     assert target.peak_growth_bytes == 80
     assert target.retained_bytes == 5
     assert fake_npu.reset_peak_memory_stats.call_count == 3
+    # The pinning record is the most-specific scope whose in-scope peak reaches
+    # the overall peak. The inner attention scope closed first at peak 170, then
+    # the outer target scope closed at peak 180 — so the outer record wins.
+    assert profiler.overall_peak_record is not None
+    assert profiler.overall_peak_record.category == "target_model"
+    assert profiler.overall_peak_record.peak_bytes == 180
 
 
 def test_disabled_activation_peak_session_is_noop():
@@ -80,6 +88,65 @@ def test_disabled_activation_peak_session_is_noop():
     fake_npu.reset_peak_memory_stats.assert_not_called()
     fake_npu.max_memory_allocated.assert_not_called()
     fake_npu.memory_allocated.assert_not_called()
+
+
+def test_global_peak_location_locates_pinning_scope():
+    # Inner moe scope reaches the absolute peak; outer model scope closes later
+    # at the same peak. The pinning record is the most-specific (latest) scope
+    # whose in-scope peak equals overall_peak_bytes.
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        # session open:100; target entry ckpt:100; moe entry ckpt:100;
+        # moe exit ckpt:200; target exit ckpt:200; session final ckpt:200.
+        max_memory_allocated=MagicMock(side_effect=[100, 100, 100, 200, 200, 200]),
+        # target baseline:100; moe baseline:130; moe exit after:160; target exit after:170.
+        memory_allocated=MagicMock(side_effect=[100, 130, 160, 170]),
+    )
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as mock_warning,
+        activation_peak_profile_session(enabled=True, rank=1) as profiler,
+    ):
+        with record_activation_peak("target_model", "target.model_forward", num_tokens=64):
+            with record_activation_peak(
+                "target_moe",
+                "target.layer.3.moe",
+                layer_idx=3,
+                num_tokens=64,
+            ):
+                pass
+
+    assert profiler is not None
+    assert profiler.overall_peak_bytes == 200
+    assert profiler.overall_peak_record is not None
+    # overall_peak_record uses a last-wins tie rule on scope exit, so the outer
+    # model scope (which closes last at the overall peak) wins the attribute.
+    assert profiler.overall_peak_record.category == "target_model"
+    assert profiler.overall_peak_record.peak_bytes == 200
+
+    global_peak_log = next(
+        call for call in mock_warning.call_args_list if "[GLOBAL_PEAK]" in call.args[0]
+    )
+    # rank, absolute_peak GiB, category, label, layer, tokens, growth MiB, baseline GiB
+    assert global_peak_log.args[0] == (
+        "[ACTIVATION_PEAK][GLOBAL_PEAK] rank=%s absolute_peak=%.3f GiB "
+        "category=%s label=%s layer=%s tokens=%s growth=%.3f MiB "
+        "baseline=%.3f GiB"
+    )
+    assert global_peak_log.args[1] == 1
+    # GLOBAL_PEAK reports the most-specific pinning location: the inner moe
+    # scope reaches the overall peak first (inner scopes close before parents),
+    # so it is the most specific scope that pins the peak.
+    assert global_peak_log.args[3] == "TARGET_MOE"
+
+    # Per-category absolute-peak location lines are emitted for both categories.
+    abs_peak_categories = {
+        call.args[2] for call in mock_warning.call_args_list if "[ABS_PEAK]" in call.args[0]
+    }
+    assert "TARGET_MODEL" in abs_peak_categories
+    assert "TARGET_MOE" in abs_peak_categories
 
 
 def test_ffn_chunk_decision_uses_current_moe_scope():
@@ -187,3 +254,126 @@ def test_mtp_moe_substage_is_noop_in_target_scope():
     assert profiler is not None
     assert [record.category for record in profiler.records] == ["target_moe"]
     assert not any("[FFN_CHUNK_DETAIL]" in call.args[0] for call in mock_warning.call_args_list)
+
+
+def test_serving_memory_log_step_does_not_sync_or_reset_peak():
+    # The serving path must never synchronize or reset the peak tracker (would
+    # break ACL graph replay). It only reads bookkeeping values.
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        max_memory_allocated=MagicMock(side_effect=[100, 130, 130]),
+        memory_allocated=MagicMock(side_effect=[100, 120, 115]),
+    )
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as mock_warning,
+    ):
+        serving_memory_log_step(rank=2, phase="pre_forward", num_tokens=4096)
+        serving_memory_log_step(rank=2, phase="post_forward", num_tokens=4096)
+
+    fake_npu.synchronize.assert_not_called()
+    fake_npu.reset_peak_memory_stats.assert_not_called()
+    step_logs = [call for call in mock_warning.call_args_list if "[STEP]" in call.args[0]]
+    assert len(step_logs) == 2
+    pre, post = step_logs
+    assert pre.args[1] == 2 and pre.args[2] == "pre_forward" and pre.args[4] == 4096
+    assert post.args[1] == 2 and post.args[2] == "post_forward"
+    # format string carries the documented fields
+    assert pre.args[0] == (
+        "[SERVING_MEMORY][STEP] rank=%s phase=%s step=%s tokens=%s "
+        "allocated=%.3f GiB run_peak=%.3f GiB"
+    )
+
+
+def test_serving_peak_step_session_logs_absolute_peak_and_components():
+    # One serving forward: target_model wraps target_attn_sfa and target_moe.
+    # The moe scope reaches the absolute peak (the most-specific pinning
+    # location). The STEP_PEAK header carries absolute_peak + at=TARGET_MOE,
+    # and a STEP_PEAK_COMP line is emitted per present component.
+    #
+    # max_memory_allocated side effects (one per checkpoint):
+    #   session open:100
+    #   target entry ckpt:100
+    #   sfa entry ckpt:100
+    #   sfa exit ckpt:120
+    #   moe entry ckpt:120
+    #   moe exit ckpt:200        <- absolute peak, pinned by moe
+    #   target exit ckpt:200
+    #   session final ckpt:200
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        max_memory_allocated=MagicMock(
+            side_effect=[100, 100, 100, 120, 120, 200, 200, 200]
+        ),
+        # target baseline:100; sfa baseline:100; sfa exit after:110;
+        # moe baseline:120; moe exit after:160; target exit after:170.
+        memory_allocated=MagicMock(side_effect=[100, 100, 110, 120, 160, 170]),
+    )
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as mock_warning,
+        serving_peak_step_session(rank=0, num_tokens=27000),
+    ):
+        with record_activation_peak("target_model", "target.model_forward", num_tokens=27000):
+            with record_activation_peak(
+                "target_attn_sfa",
+                "target.layer.5.attn_sfa",
+                layer_idx=5,
+                num_tokens=27000,
+            ):
+                pass
+            with record_activation_peak(
+                "target_moe",
+                "target.layer.5.moe",
+                layer_idx=5,
+                num_tokens=27000,
+            ):
+                pass
+
+    step_peak_logs = [call for call in mock_warning.call_args_list if "[STEP_PEAK]" in call.args[0]]
+    assert step_peak_logs, "expected a STEP_PEAK header line"
+    header = step_peak_logs[0]
+    # absolute_peak (GiB) is args[4]; at= is args[5]
+    assert header.args[4] == 200 / (1024**3)
+    assert header.args[5] == "MOE"
+
+    comp_logs = {
+        call.args[3]: call
+        for call in mock_warning.call_args_list
+        if "[STEP_PEAK_COMP]" in call.args[0]
+    }
+    assert "ATTN_SFA" in comp_logs
+    assert "MOE" in comp_logs
+    # moe component peak equals the absolute peak; sfa peak is its own 120.
+    assert comp_logs["MOE"].args[4] == 200 / (1024**3)
+    assert comp_logs["ATTN_SFA"].args[4] == 120 / (1024**3)
+    # growth fields are populated (MiB).
+    assert comp_logs["MOE"].args[5] == (200 - 120) / (1024**2)
+    assert comp_logs["ATTN_SFA"].args[5] == (120 - 100) / (1024**2)
+
+
+def test_serving_peak_step_session_restores_contextvar():
+    # After the session exits, no profiler should be active (a subsequent
+    # record_activation_peak must be a no-op that does not touch the allocator).
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        max_memory_allocated=MagicMock(side_effect=[100, 100, 100]),
+        memory_allocated=MagicMock(side_effect=[100]),
+    )
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+        serving_peak_step_session(rank=0, num_tokens=10),
+    ):
+        pass
+    # reset_peak_memory_stats is called once at session entry; a lingering
+    # profiler would cause record_activation_peak to call it again.
+    before = fake_npu.reset_peak_memory_stats.call_count
+    with record_activation_peak("target_model", "target.model_forward"):
+        pass
+    assert fake_npu.reset_peak_memory_stats.call_count == before

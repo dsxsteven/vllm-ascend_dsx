@@ -1,5 +1,6 @@
 import math
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
@@ -20,6 +21,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import (
     get_dsa_attn_kv_plan,
@@ -1866,44 +1868,71 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         o_proj_input = hidden_states.new_zeros(o_proj_input_shape)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
         wait_for_kv_layer_from_connector(layer_name)
-        cache_is_prepared = self._prepare_caches_before_attention(
-            layer_name,
-            hidden_states,
-            kv_cache,
-            attn_metadata,
+        # Per-subpart activation-peak scopes; nullcontext outside debug
+        # profile_run, so the hot path pays nothing. V1 fuses q/kv projection
+        # into _forward_attention (multistream overlap), so only the attention
+        # body and o_proj are split here — finer splits would break the
+        # overlap stream contract with synchronize checkpoints.
+        profiling = is_activation_peak_profiling()
+        scope_label = layer_name
+        sfa_ctx = (
+            record_activation_peak(
+                "target_attn_sfa",
+                f"{scope_label}.attn.sfa",
+                num_tokens=actual_tokens,
+            )
+            if profiling
+            else nullcontext()
         )
-        if actual_tokens == 0:
-            output.zero_()
-            notify_kv_cache_written(layer_name)
-            with attention_transfer_window():
-                pass
-            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
-            return output
+        with sfa_ctx:
+            cache_is_prepared = self._prepare_caches_before_attention(
+                layer_name,
+                hidden_states,
+                kv_cache,
+                attn_metadata,
+            )
+            if actual_tokens == 0:
+                output.zero_()
+                notify_kv_cache_written(layer_name)
+                with attention_transfer_window():
+                    pass
+                maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+                return output
 
-        req_metadata = _require_req_metadata(common_attn_metadata)
-        o_proj_input[:actual_tokens] = self._forward_attention(
-            layer_name,
-            hidden_states[:actual_tokens],
-            kv_cache,
-            layer_metadata,
-            cache_is_prepared,
-        )
-        cos = req_metadata.cos[layer_name]
-        sin = req_metadata.sin[layer_name]
+            req_metadata = _require_req_metadata(common_attn_metadata)
+            o_proj_input[:actual_tokens] = self._forward_attention(
+                layer_name,
+                hidden_states[:actual_tokens],
+                kv_cache,
+                layer_metadata,
+                cache_is_prepared,
+            )
+            cos = req_metadata.cos[layer_name]
+            sin = req_metadata.sin[layer_name]
 
-        negate_sin = get_current_hardware_profile().supports(HardwareCapability.INPLACE_PARTIAL_ROTARY_MUL_NEGATE_SIN)
-        sin_arg = sin[:actual_tokens] if negate_sin else -sin[:actual_tokens]
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            o_proj_input[:actual_tokens].unsqueeze(1),
-            cos[:actual_tokens],
-            sin_arg,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-            negate_sin=negate_sin,
-        )
+            negate_sin = get_current_hardware_profile().supports(HardwareCapability.INPLACE_PARTIAL_ROTARY_MUL_NEGATE_SIN)
+            sin_arg = sin[:actual_tokens] if negate_sin else -sin[:actual_tokens]
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                o_proj_input[:actual_tokens].unsqueeze(1),
+                cos[:actual_tokens],
+                sin_arg,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+                negate_sin=negate_sin,
+            )
 
         # o
-        self._forward_o_proj(o_proj_input, output)
+        o_proj_ctx = (
+            record_activation_peak(
+                "target_attn_o_proj",
+                f"{scope_label}.attn.o_proj",
+                num_tokens=actual_tokens,
+            )
+            if profiling
+            else nullcontext()
+        )
+        with o_proj_ctx:
+            self._forward_o_proj(o_proj_input, output)
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
