@@ -594,23 +594,24 @@ class AscendConfig:
     Requires ``enforce_eager=true``."""
     activation_peak_debug_rank: int = 0
     """Rank that logs activation peaks: -1 for all ranks, else one rank id."""
-    serving_peak_debug: bool = False
-    """Per-step scoped activation-peak logging during real request serving
-    (not just profile_run). Wraps each serving forward in a throwaway
-    ``ActivationPeakProfiler`` so the existing ``record_activation_peak``
-    scopes in the model/attention/MoE paths fire, then logs the step's
-    absolute memory peak, the scope that pins it (moe/attn_sfa/
-    attn_qkv_proj/...) and each attention sub-component's absolute peak
-    plus its growth delta. Requires ``enforce_eager=true`` (the per-scope
-    ``torch.npu.synchronize()`` + ``reset_peak_memory_stats`` would break
-    ACL graph capture/replay) and is debug-only: two synchronizes per
-    scope per step add real serving latency. When this is on it replaces
-    the lightweight ``[SERVING_MEMORY][STEP]`` log (which can't coexist
-    with the per-step peak reset). Set ``serving_peak_debug_rank`` to
-    0 (rank 0) or -1 (all ranks) to select which ranks log."""
-    serving_peak_debug_rank: int = 0
-    """Rank that logs serving per-step peaks: -1 for all ranks, else one
-    rank id."""
+    activation_peak_serving: bool = False
+    """Per-request activation-peak profiling during real request serving
+    (not just the startup profile_run). When set, each served prefill
+    forward is wrapped in ``request_activation_peak_session`` and prints a
+    ``[ACTIVATION_PEAK][REQUEST_SUMMARY]`` block: the step's absolute
+    memory peak and the component that drove it (moe/attn q_proj/sfa/
+    o_proj/...), the attention peak with its driving component, and the
+    per-component attention breakdown (peak + growth) plus the peak
+    decomposition (growth + carried baseline). Requires
+    ``activation_peak_debug`` and ``enforce_eager=true`` (the session
+    synchronizes every scope and resets the allocator peak per step, which
+    would break ACL graph capture/replay). The lightweight
+    ``[SERVING_MEMORY][STEP]`` log is suppressed when this is on."""
+    activation_peak_per_layer: bool = False
+    """Print one ``[ACTIVATION_PEAK][PER_LAYER_ATTN]`` line per attention
+    layer (that layer's absolute attention peak, the component that drove
+    it, and the growth at that component) in addition to the single
+    global attn-peak line. Requires ``activation_peak_debug``."""
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -934,19 +935,26 @@ class AscendConfig:
                 "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
             )
 
-        if self.serving_peak_debug_rank < -1:
+        if self.activation_peak_serving and not self.activation_peak_debug:
             raise ValueError(
-                "serving_peak_debug_rank must be -1 (all ranks) or a non-negative rank, got "
-                f"{self.serving_peak_debug_rank}"
+                "activation_peak_serving requires activation_peak_debug to be enabled as well."
             )
-        if self.serving_peak_debug and not getattr(vllm_config.model_config, "enforce_eager", False):
-            raise ValueError("serving_peak_debug requires eager mode; set enforce_eager=true.")
-        if self.serving_peak_debug:
+        if self.activation_peak_serving and not getattr(
+            vllm_config.model_config, "enforce_eager", False
+        ):
+            raise ValueError(
+                "activation_peak_serving requires eager mode; set enforce_eager=true."
+            )
+        if self.activation_peak_serving:
             logger.warning_once(
-                "Serving per-step peak debugging is enabled on rank %s. "
-                "Two NPU synchronizes per scope per step will add real serving latency; "
+                "Activation peak debugging is enabled for serving on rank %s. "
+                "NPU synchronization on every serving step will add real latency; "
                 "the lightweight [SERVING_MEMORY][STEP] log is suppressed in this mode.",
-                "all" if self.serving_peak_debug_rank == -1 else self.serving_peak_debug_rank,
+                "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
+            )
+        if self.activation_peak_per_layer and not self.activation_peak_debug:
+            raise ValueError(
+                "activation_peak_per_layer requires activation_peak_debug to be enabled as well."
             )
 
         if self.ffn_chunk_size <= 0:
