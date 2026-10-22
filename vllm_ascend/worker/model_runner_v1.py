@@ -119,20 +119,6 @@ from vllm.v1.worker.utils import (
     prepare_kernel_block_sizes,
     raise_if_nan_logits,
 )
-<<<<<<< HEAD
-
-# yapf: enable
-from vllm_ascend.activation_memory import (
-    ActivationPeakProfiler,
-    activation_peak_profile_session,
-    record_activation_buffer,
-    record_activation_peak,
-    request_activation_peak_session,
-    serving_memory_log_step,
-)
-from vllm_ascend.ascend_config import get_ascend_config
-=======
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
@@ -438,25 +424,8 @@ class NPUModelRunner(GPUModelRunner):
         # Serving-path memory logging reuses the activation_peak_debug flag.
         # Cached once to avoid re-reading the config every execute_model step;
         # when False the per-step snapshot calls are skipped entirely.
-<<<<<<< HEAD
-        self.activation_peak_debug = bool(
-            getattr(self.ascend_config, "activation_peak_debug", False)
-        )
-        self.activation_peak_debug_rank = int(
-            getattr(self.ascend_config, "activation_peak_debug_rank", 0)
-        )
-        # Per-request activation-peak profiling during real serving. Reuses the
-        # activation_peak_debug rank filter; gated by activation_peak_serving.
-        self.activation_peak_serving = bool(
-            getattr(self.ascend_config, "activation_peak_serving", False)
-        )
-        self.activation_peak_per_layer = bool(
-            getattr(self.ascend_config, "activation_peak_per_layer", False)
-        )
-=======
         self.activation_peak_debug = bool(getattr(self.ascend_config, "activation_peak_debug", False))
         self.activation_peak_debug_rank = int(getattr(self.ascend_config, "activation_peak_debug_rank", 0))
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         self.kvpp = KVPPRuntime()
@@ -2520,52 +2489,12 @@ class NPUModelRunner(GPUModelRunner):
                         mamba_copy_connector = connector
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
-<<<<<<< HEAD
-            # Per-request activation-peak profiling (activation_peak_serving)
-            # wraps one served forward in request_activation_peak_session and
-            # prints [ACTIVATION_PEAK][REQUEST_SUMMARY] with the step's peak,
-            # its driving component, and the per-component attention breakdown.
-            # It synchronizes every scope and resets the allocator peak per
-            # step, which clobbers the lightweight STEP log's cumulative
-            # run_peak — so the STEP log is skipped when the request session is
-            # active. The request session only fires on prefill (multi-token)
-            # steps; decode steps share a tiny footprint and would only add
-            # log noise.
-            request_peak_enabled = (
-                self.activation_peak_serving
-                and self._request_peak_rank_matches()
-                and self._is_prefill_step(num_tokens_padded, self.input_batch.num_reqs)
-            )
-            serving_log_rank = (
-                self._serving_memory_rank()
-                if (
-                    self.activation_peak_debug
-                    and not request_peak_enabled
-                )
-                else None
-            )
-            if serving_log_rank is not None:
-                serving_memory_log_step(
-                    rank=serving_log_rank,
-                    phase="pre_forward",
-                    num_tokens=num_tokens_padded,
-                )
-            with request_activation_peak_session(
-                enabled=request_peak_enabled,
-                rank=self._request_peak_rank(),
-                num_tokens=num_tokens_padded,
-                per_layer_attn=self.activation_peak_per_layer,
-            ):
-                hidden_states = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-=======
             serving_mem_rank = self._serving_memory_rank()
             if serving_mem_rank is not None:
                 serving_memory_log_step(
                     rank=serving_mem_rank,
                     phase="pre_forward",
                     num_tokens=num_tokens_padded,
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
                 )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
@@ -2580,15 +2509,6 @@ class NPUModelRunner(GPUModelRunner):
                     phase="post_forward",
                     num_tokens=num_tokens_padded,
                 )
-<<<<<<< HEAD
-            if serving_log_rank is not None:
-                serving_memory_log_step(
-                    rank=serving_log_rank,
-                    phase="post_forward",
-                    num_tokens=num_tokens_padded,
-                )
-=======
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
             # Verify every scheduled layer executed its deferred copy.
             if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
                 mamba_copy_connector.finish_mamba_state_copy()
@@ -4268,42 +4188,10 @@ class NPUModelRunner(GPUModelRunner):
         if not getattr(self, "activation_peak_debug", False):
             return None
         configured = int(getattr(self, "activation_peak_debug_rank", 0))
-<<<<<<< HEAD
-        global_rank = (
-            dist.get_rank()
-            if dist.is_available() and dist.is_initialized()
-            else 0
-        )
+        global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         if configured == -1:
             return global_rank
         return global_rank if global_rank == configured else None
-
-    def _request_peak_rank(self) -> int:
-        """Global rank used for per-request activation-peak logging."""
-        return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-
-    def _request_peak_rank_matches(self) -> bool:
-        """Whether this rank should emit the per-request activation-peak log.
-
-        Reuses ``activation_peak_debug_rank`` for rank filtering: -1 means all
-        ranks, otherwise only the configured rank logs.
-        """
-        configured = int(getattr(self, "activation_peak_debug_rank", 0))
-=======
-        global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
-        if configured == -1:
-            return True
-        return self._request_peak_rank() == configured
-
-    def _is_prefill_step(self, num_tokens_padded: int, num_reqs: int) -> bool:
-        """Whether the current scheduler step is a prefill (multi-token) step.
-
-        Requests are chunk-prefilled, so the first step of each request is the
-        peak-heavy one; decode steps all share the same tiny footprint and
-        would only add log noise.
-        """
-        return num_tokens_padded > num_reqs
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -4338,10 +4226,7 @@ class NPUModelRunner(GPUModelRunner):
         global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         activation_debug = activation_debug and (configured_rank == -1 or configured_rank == global_rank)
         self.activation_peak_profile_result: ActivationPeakProfiler | None = None
-        per_layer_attn = bool(getattr(self, "activation_peak_per_layer", False))
-        with activation_peak_profile_session(
-            enabled=activation_debug, rank=global_rank, per_layer_attn=per_layer_attn
-        ) as profiler:
+        with activation_peak_profile_session(enabled=activation_debug, rank=global_rank) as profiler:
             if profiler is not None:
                 speculative_method = getattr(self.speculative_config, "method", "none")
                 logger.warning(

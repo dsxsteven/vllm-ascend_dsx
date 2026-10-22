@@ -48,19 +48,6 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-<<<<<<< HEAD
-
-from vllm_ascend.activation_memory import (
-    ActivationPeakProfiler,
-    activation_peak_profile_session,
-    record_activation_buffer,
-    record_activation_peak,
-    request_activation_peak_session,
-    serving_memory_log_step,
-)
-from vllm_ascend.ascend_config import get_ascend_config
-=======
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
     get_mc2_tokens_capacity,
@@ -159,24 +146,8 @@ class NPUModelRunner(GPUModelRunner):
         self.ascend_config = get_ascend_config()
         # Serving-path memory logging reuses the activation_peak_debug flag,
         # cached once to avoid re-reading config per execute_model step.
-<<<<<<< HEAD
-        self.activation_peak_debug = bool(
-            getattr(self.ascend_config, "activation_peak_debug", False)
-        )
-        self.activation_peak_debug_rank = int(
-            getattr(self.ascend_config, "activation_peak_debug_rank", 0)
-        )
-        # Per-request activation-peak profiling during real serving.
-        self.activation_peak_serving = bool(
-            getattr(self.ascend_config, "activation_peak_serving", False)
-        )
-        self.activation_peak_per_layer = bool(
-            getattr(self.ascend_config, "activation_peak_per_layer", False)
-        )
-=======
         self.activation_peak_debug = bool(getattr(self.ascend_config, "activation_peak_debug", False))
         self.activation_peak_debug_rank = int(getattr(self.ascend_config, "activation_peak_debug_rank", 0))
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
         self.sparse_kv_offload_manager = None
         self.kvpp = KVPPRuntime()
         # Adaptive verification uses this flag to apply FIA-specific query
@@ -572,62 +543,13 @@ class NPUModelRunner(GPUModelRunner):
                     else nullcontext()
                 )
                 with target_scope:
-<<<<<<< HEAD
-                    # Per-request activation-peak profiling
-                    # (activation_peak_serving) wraps one served forward in
-                    # request_activation_peak_session and prints
-                    # [ACTIVATION_PEAK][REQUEST_SUMMARY] with the step's peak,
-                    # its driving component, and the per-component attention
-                    # breakdown. It syncs every scope and resets the allocator
-                    # peak per step, which clobbers the lightweight STEP log's
-                    # cumulative run_peak — so the STEP log is skipped when
-                    # the request session is active. Only fires on real
-                    # serving steps (never dummy/profile) and only on prefill
-                    # (multi-token) steps.
-                    request_peak_enabled = (
-                        not dummy_run
-                        and not is_profile
-                        and self.activation_peak_serving
-                        and self._request_peak_rank_matches()
-                        and self._is_prefill_step(scheduler_output)
-                    )
-                    serving_log_rank = (
-                        self._serving_memory_rank()
-                        if (
-                            not dummy_run
-                            and not is_profile
-                            and not request_peak_enabled
-                            and self.activation_peak_debug
-                        )
-                        else None
-                    )
-                    if serving_log_rank is not None:
-=======
                     serving_mem_rank = self._serving_memory_rank() if not dummy_run and not is_profile else None
                     if serving_mem_rank is not None:
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
                         serving_memory_log_step(
-                            rank=serving_log_rank,
+                            rank=serving_mem_rank,
                             phase="pre_forward",
                             num_tokens=scheduler_output.total_num_scheduled_tokens,
                         )
-<<<<<<< HEAD
-                    with request_activation_peak_session(
-                        enabled=request_peak_enabled,
-                        rank=self._request_peak_rank(),
-                        num_tokens=scheduler_output.total_num_scheduled_tokens,
-                        per_layer_attn=self.activation_peak_per_layer,
-                    ):
-                        output = super().execute_model(
-                            scheduler_output,
-                            intermediate_tensors=intermediate_tensors,
-                            dummy_run=dummy_run,
-                            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                            is_profile=is_profile,
-                            context_len=context_len,
-                            valid_dummy_state_slots=valid_dummy_state_slots,
-                        )
-=======
                     output = super().execute_model(
                         scheduler_output,
                         intermediate_tensors=intermediate_tensors,
@@ -637,11 +559,10 @@ class NPUModelRunner(GPUModelRunner):
                         context_len=context_len,
                         valid_dummy_state_slots=valid_dummy_state_slots,
                     )
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
                     forward_failed = False
-                    if serving_log_rank is not None:
+                    if serving_mem_rank is not None:
                         serving_memory_log_step(
-                            rank=serving_log_rank,
+                            rank=serving_mem_rank,
                             phase="post_forward",
                             num_tokens=scheduler_output.total_num_scheduled_tokens,
                         )
@@ -721,44 +642,6 @@ class NPUModelRunner(GPUModelRunner):
             return global_rank
         return global_rank if global_rank == configured else None
 
-<<<<<<< HEAD
-    def _request_peak_rank(self) -> int:
-        """Global rank used for per-request activation-peak logging."""
-        return (
-            torch.distributed.get_rank()
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else 0
-        )
-
-    def _request_peak_rank_matches(self) -> bool:
-        """Whether this rank should emit the per-request activation-peak log.
-
-        Reuses ``activation_peak_debug_rank`` for rank filtering: -1 means all
-        ranks, otherwise only the configured rank logs.
-        """
-        configured = int(getattr(self, "activation_peak_debug_rank", 0))
-        if configured == -1:
-            return True
-        return self._request_peak_rank() == configured
-
-    def _is_prefill_step(self, scheduler_output) -> bool:
-        """Whether the current scheduler step is a prefill (multi-token) step.
-
-        Requests are chunk-prefilled, so the first step of each request is the
-        peak-heavy one; decode steps all share a tiny footprint and would only
-        add log noise. A step is prefill-heavy when it schedules more tokens
-        than there are active requests.
-        """
-        num_tokens = scheduler_output.total_num_scheduled_tokens
-        num_reqs = (
-            len(scheduler_output.num_scheduled_tokens)
-            if hasattr(scheduler_output, "num_scheduled_tokens")
-            else 0
-        )
-        return num_tokens > max(num_reqs, 0)
-
-=======
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
     @torch.inference_mode()
     def profile_run(self) -> None:
         """Override GPUModelRunner.profile_run for Ascend NPUs.
@@ -782,10 +665,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         activation_debug = activation_debug and (configured_rank == -1 or configured_rank == global_rank)
         self.activation_peak_profile_result: ActivationPeakProfiler | None = None
-        per_layer_attn = bool(getattr(self, "activation_peak_per_layer", False))
-        with activation_peak_profile_session(
-            enabled=activation_debug, rank=global_rank, per_layer_attn=per_layer_attn
-        ) as profiler:
+        with activation_peak_profile_session(enabled=activation_debug, rank=global_rank) as profiler:
             if profiler is not None:
                 speculative_method = getattr(self.speculative_config, "method", "none")
                 logger.warning(

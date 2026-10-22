@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-<<<<<<< HEAD
-"""Scoped activation-memory peak diagnostics for Ascend profile runs."""
-=======
 """Scoped activation-memory diagnostics for eager Ascend execution.
 
 Enable activation_peak_debug for startup profiling. serving_peak_debug and
@@ -26,7 +23,6 @@ Fused operators are reported as fused scopes, without invented internal peaks.
 Startup preserves the historical peak for NPUWorker KV-sizing compensation;
 serving uses fresh per-phase windows. All detailed collection is opt-in.
 """
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
 
 from __future__ import annotations
 
@@ -45,29 +41,6 @@ _MIB = 1024**2
 _GIB = 1024**3
 
 
-def _is_moe_stage(category: str) -> bool:
-    """Whether a category is an MoE/FFN stage.
-
-    MoE stages run once per layer, so their per-stage logs are far too noisy;
-    they are aggregated into the summary instead of printed individually.
-    """
-    return "moe" in category or "ffn" in category
-
-
-def _is_attention_stage(category: str) -> bool:
-    """Whether a category is an attention stage (whole scope or component)."""
-    return "_attn_" in category or category.endswith("_attention")
-
-
-def _attn_stage_name(category: str) -> str:
-    """Human readable component name, e.g. `target_attn_q_proj` -> `q_proj`."""
-    return category.split("_attn_", 1)[1] if "_attn_" in category else category
-
-
-def _fmt_layer(layer_idx: int | None) -> str:
-    return "-" if layer_idx is None else str(layer_idx)
-
-
 @dataclass(frozen=True)
 class ActivationPeakRecord:
     category: str
@@ -80,10 +53,6 @@ class ActivationPeakRecord:
     peak_growth_bytes: int
     retained_bytes: int
     elapsed_ms: float
-    # Category of the innermost scope active when this scope's peak was set,
-    # i.e. the "driver" of the peak. None if the peak happened outside any
-    # nested measured scope.
-    peak_component: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,10 +71,6 @@ class _ActiveScope:
     baseline_bytes: int
     started_at: float
     peak_bytes: int = 0
-    # Innermost measured scope active when peak_bytes was recorded (the
-    # component whose execution drove the peak); None if no nested scope was
-    # active at that moment.
-    peak_component: str | None = None
 
 
 @dataclass
@@ -121,17 +86,6 @@ class ActivationPeakProfiler:
     records: list[ActivationPeakRecord] = field(default_factory=list)
     buffers: list[ActivationBufferRecord] = field(default_factory=list)
     overall_peak_bytes: int = 0
-<<<<<<< HEAD
-    verbose_stages: bool = False
-    # Suppress per-layer/per-chunk logs; only emit the end-of-step summary.
-    quiet_stages: bool = False
-    # Print one line per attention layer (that layer's absolute peak, the
-    # component that drove it, and the growth at that component) at the end
-    # of each profiled step.
-    per_layer_attn: bool = False
-    _scopes: list[_ActiveScope] = field(default_factory=list)
-
-=======
     failed: bool = False
     # The record whose in-scope peak equals overall_peak_bytes — i.e. the
     # scope instance that *pins* the absolute memory peak. Updated on scope
@@ -144,29 +98,10 @@ class ActivationPeakProfiler:
         record = self.overall_peak_record
         return record if record is not None and record.peak_bytes == self.overall_peak_bytes else None
 
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
     def _synchronize(self) -> None:
         torch.npu.synchronize()
 
     def _checkpoint(self) -> int:
-<<<<<<< HEAD
-        self._synchronize()
-        peak_bytes = int(torch.npu.max_memory_allocated())
-        prev_overall = self.overall_peak_bytes
-        self.overall_peak_bytes = max(self.overall_peak_bytes, peak_bytes)
-        if peak_bytes > prev_overall and peak_bytes > 0:
-            # This checkpoint set a new all-time peak: remember which nested
-            # measured scope was executing when it happened, so the summary
-            # can attribute the peak to the component that drove it.
-            driver = self._scopes[-1].category if len(self._scopes) > 1 else None
-            for scope in self._scopes:
-                if scope.peak_bytes < peak_bytes:
-                    scope.peak_bytes = peak_bytes
-                    scope.peak_component = driver
-        else:
-            for scope in self._scopes:
-                scope.peak_bytes = max(scope.peak_bytes, peak_bytes)
-=======
         try:
             self._synchronize()
             peak_bytes = int(torch.npu.max_memory_allocated())
@@ -182,7 +117,6 @@ class ActivationPeakProfiler:
             self.overall_peak_record = None
         for scope in self._scopes:
             scope.peak_bytes = max(scope.peak_bytes, peak_bytes)
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
         return peak_bytes
 
     @contextmanager
@@ -221,10 +155,7 @@ class ActivationPeakProfiler:
             self._scopes.pop()
             peak_bytes = max(scope.peak_bytes, allocated_after_bytes)
             if self._scopes:
-                parent = self._scopes[-1]
-                if peak_bytes > parent.peak_bytes:
-                    parent.peak_bytes = peak_bytes
-                    parent.peak_component = scope.peak_component
+                self._scopes[-1].peak_bytes = max(self._scopes[-1].peak_bytes, peak_bytes)
             record = ActivationPeakRecord(
                 category=category,
                 label=label,
@@ -236,27 +167,8 @@ class ActivationPeakProfiler:
                 peak_growth_bytes=max(0, peak_bytes - baseline_bytes),
                 retained_bytes=allocated_after_bytes - baseline_bytes,
                 elapsed_ms=(time.perf_counter() - scope.started_at) * 1000,
-                peak_component=scope.peak_component,
             )
             self.records.append(record)
-<<<<<<< HEAD
-            if self.verbose_stages and not self.quiet_stages and not _is_moe_stage(category):
-                logger.warning(
-                    "[ACTIVATION_PEAK][STAGE] rank=%s category=%s label=%s "
-                    "layer=%s tokens=%s baseline=%.3f GiB peak=%.3f GiB "
-                    "growth=%.3f MiB retained=%+.3f MiB elapsed=%.3f ms",
-                    self.rank,
-                    category.upper(),
-                    label,
-                    "-" if layer_idx is None else layer_idx,
-                    "-" if num_tokens is None else num_tokens,
-                    baseline_bytes / _GIB,
-                    peak_bytes / _GIB,
-                    record.peak_growth_bytes / _MIB,
-                    record.retained_bytes / _MIB,
-                    record.elapsed_ms,
-                )
-=======
             if self._peak_owner is scope:
                 self.overall_peak_record = record
             # Separate the next segment from this child's allocator high-water
@@ -280,11 +192,8 @@ class ActivationPeakProfiler:
                 record.retained_bytes / _MIB,
                 record.elapsed_ms,
             )
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
 
     def record_buffer(self, category: str, label: str, size_bytes: int) -> None:
-        if self.quiet_stages:
-            return
         record = ActivationBufferRecord(
             category=category,
             label=label,
@@ -300,276 +209,7 @@ class ActivationPeakProfiler:
             size_bytes / _GIB,
         )
 
-    def _resolve_peak_driver(
-        self,
-        scope_record: ActivationPeakRecord | None,
-    ) -> ActivationPeakRecord | None:
-        """Return the component record that drove `scope_record`'s peak.
-
-        `scope_record.peak_component` names the innermost measured scope active
-        the instant the peak was first observed. Map it back to that component
-        record (same layer, matching category). Fall back to matching by
-        absolute peak when the timing-sensitive attribution is None (the peak
-        first showed up on a component's entry checkpoint, before its scope was
-        pushed — its later exit checkpoint observes the same peak value).
-
-        If `scope_record` is itself a leaf component whose peak was set in its
-        own scope (peak_component == its own category), it is its own driver;
-        return it directly rather than searching for a (nonexistent) child.
-        """
-        if scope_record is None:
-            return None
-        if scope_record.peak_component == scope_record.category:
-            return scope_record
-        candidates = [
-            record
-            for record in self.records
-            if record.layer_idx == scope_record.layer_idx and record is not scope_record
-        ]
-        driver = next(
-            (record for record in candidates if scope_record.peak_component == record.category),
-            None,
-        )
-        if driver is None:
-            driver = next(
-                (record for record in candidates if record.peak_bytes == scope_record.peak_bytes),
-                None,
-            )
-        return driver
-
-    def log_request_summary(self) -> None:
-        """Log the focused per-request summary.
-
-        Prints:
-        - the overall NPU memory peak of the step,
-        - the attention peak and the layer it occurred on,
-        - the MoE peak and the layer it occurred on,
-        - the per-component attention memory breakdown at the attention peak layer.
-        """
-        if not self.records:
-            logger.warning("[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s no measured stages", self.rank)
-            return
-
-        attention_records = [
-            record for record in self.records if _is_attention_stage(record.category)
-        ]
-        # The attention peak is the whole-attention scope (`*_attention`);
-        # `*_attn_*` records are its components and must not be selected here,
-        # otherwise the peak line points at a component and the component
-        # breakdown lists the whole scope as one of its own parts.
-        # Select by absolute peak_bytes (not growth) so the attention breakdown
-        # reflects the layer where the all-time peak actually occurred, matching
-        # the total_peak line. Selecting by growth would pick the layer with the
-        # largest *increment* (often layer 0, whose low baseline inflates growth)
-        # and misattribute the peak to a different layer than total_peak.
-        whole_attention_records = [
-            record for record in attention_records if record.category.endswith("_attention")
-        ]
-        attn_peak = max(
-            whole_attention_records, key=lambda item: item.peak_bytes, default=None
-        )
-        overall_peak_record = max(self.records, key=lambda item: item.peak_bytes, default=None)
-
-        # Resolve the component that drove the global absolute peak. The
-        # whole-scope record's `peak_component` names the innermost measured
-        # scope active the instant the all-time peak was first observed; map it
-        # back to that component record to also report the growth at that
-        # component. Falls back to matching by absolute peak when the timing-
-        # sensitive attribution is None (peak first observed on a component's
-        # entry checkpoint, before its scope was pushed).
-        overall_driver = self._resolve_peak_driver(overall_peak_record)
-
-        logger.warning(
-            "[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s total_peak=%.3f GiB "
-            "at layer=%s label=%s component=%s growth=%.3f MiB",
-            self.rank,
-            self.overall_peak_bytes / _GIB,
-            _fmt_layer(overall_peak_record.layer_idx) if overall_peak_record else "-",
-            overall_peak_record.label if overall_peak_record else "-",
-            _attn_stage_name(overall_driver.category)
-            if overall_driver is not None
-            else (
-                _attn_stage_name(overall_peak_record.category)
-                if overall_peak_record
-                else "unknown"
-            ),
-            (overall_driver.peak_growth_bytes / _MIB)
-            if overall_driver is not None
-            else ((overall_peak_record.peak_growth_bytes / _MIB) if overall_peak_record else 0.0),
-        )
-        if attn_peak is not None:
-            peak_layer_components = [
-                record
-                for record in attention_records
-                if record.layer_idx == attn_peak.layer_idx
-                and record.category != attn_peak.category
-            ]
-            # Determine which component the attention peak occurred in.
-            # Prefer the checkpoint-time attribution (`peak_component`), which
-            # records the innermost scope active the instant a new all-time peak
-            # was first observed. That attribution is timing-sensitive: if the
-            # new peak first shows up on a component's *entry* checkpoint (the
-            # component scope has not been pushed yet, so the scope stack holds
-            # only the whole-attention scope), `peak_component` is None even
-            # though the peak belongs to the component that is about to run --
-            # its later exit checkpoint observes the same peak value.
-            #
-            # Fall back to matching by absolute peak: components execute
-            # sequentially, so the component whose `peak_bytes` equals the
-            # attention peak is the one executing when the peak was set.
-            driver = self._resolve_peak_driver(attn_peak)
-            # Annotate which component (q_proj, core, o_proj, hc_post, ...) was
-            # executing when the attention peak was recorded, so the peak
-            # location is visible at a glance instead of only in the breakdown.
-            peak_component_name = (
-                _attn_stage_name(driver.category) if driver is not None else "unknown"
-            )
-            logger.warning(
-                "[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s attn_peak=%.3f GiB "
-                "(growth=%.3f MiB) at layer=%s label=%s component=%s",
-                self.rank,
-                attn_peak.peak_bytes / _GIB,
-                attn_peak.peak_growth_bytes / _MIB,
-                _fmt_layer(attn_peak.layer_idx),
-                attn_peak.label,
-                peak_component_name,
-            )
-            for record in sorted(
-                peak_layer_components,
-                key=lambda item: item.peak_growth_bytes,
-                reverse=True,
-            ):
-                logger.warning(
-                    "[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s attn component=%s "
-                    "peak=%.3f GiB growth=%.3f MiB",
-                    self.rank,
-                    _attn_stage_name(record.category),
-                    record.peak_bytes / _GIB,
-                    record.peak_growth_bytes / _MIB,
-                )
-            if peak_layer_components:
-                # The components run sequentially, so their growths do not
-                # coexist and must not be summed. The attention peak
-                # decomposes instead as: the growth of the component that was
-                # executing when the peak was recorded, plus the baseline
-                # memory already resident when that component started.
-                if driver is not None:
-                    carried_bytes = attn_peak.peak_bytes - driver.peak_growth_bytes
-                    logger.warning(
-                        "[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s attn peak breakdown: "
-                        "%s growth=%.3f MiB + carried=%.3f MiB (non-component residual "
-                        "at component entry) = %.3f MiB total",
-                        self.rank,
-                        _attn_stage_name(driver.category),
-                        driver.peak_growth_bytes / _MIB,
-                        carried_bytes / _MIB,
-                        attn_peak.peak_bytes / _MIB,
-                    )
-                else:
-                    logger.warning(
-                        "[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s attn peak breakdown: "
-                        "peak=%.3f MiB occurred outside measured attn components "
-                        "(between components; growth values above do not sum)",
-                        self.rank,
-                        attn_peak.peak_bytes / _MIB,
-                    )
-
-        moe_records = [
-            record
-            for record in self.records
-            if record.category.endswith("_moe") or "moe" in record.category or "ffn" in record.category
-        ]
-        # Select by absolute peak_bytes to match total_peak attribution (see
-        # attn_peak selection rationale above).
-        moe_peak = max(moe_records, key=lambda item: item.peak_bytes, default=None)
-        if moe_peak is not None:
-            logger.warning(
-                "[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s moe_peak=%.3f GiB "
-                "(growth=%.3f MiB) at layer=%s label=%s",
-                self.rank,
-                moe_peak.peak_bytes / _GIB,
-                moe_peak.peak_growth_bytes / _MIB,
-                _fmt_layer(moe_peak.layer_idx),
-                moe_peak.label,
-            )
-
-        # Per-layer attention peak breakdown (opt-in): for every layer, print
-        # that layer's absolute attention peak, the component that drove it,
-        # and the growth at that component. One line per layer so each layer's
-        # peak location is visible, not just the single global attn-peak layer.
-        if self.per_layer_attn:
-            self._log_per_layer_attn_peaks(attention_records)
-
-    def _log_per_layer_attn_peaks(
-        self,
-        attention_records: list[ActivationPeakRecord],
-    ) -> None:
-        """Print one line per attention layer: peak, driver component, growth."""
-        # Group attention records by layer_idx. Whole-attention scopes are
-        # `*_attention`; component scopes are `*_attn_*` (see
-        # _is_attention_stage). Only layers with a whole-attention scope have
-        # a per-layer attn peak.
-        whole_by_layer: dict[int | None, ActivationPeakRecord] = {}
-        components_by_layer: dict[int | None, list[ActivationPeakRecord]] = {}
-        for record in attention_records:
-            if record.category.endswith("_attention"):
-                # Keep the highest-peak whole-attention record per layer (a
-                # layer may run more than once, e.g. target vs draft reuse).
-                prev = whole_by_layer.get(record.layer_idx)
-                if prev is None or record.peak_bytes > prev.peak_bytes:
-                    whole_by_layer[record.layer_idx] = record
-            else:
-                components_by_layer.setdefault(record.layer_idx, []).append(record)
-
-        if not whole_by_layer:
-            return
-
-        logger.warning(
-            "[ACTIVATION_PEAK][PER_LAYER_ATTN] rank=%s layers=%s",
-            self.rank,
-            len(whole_by_layer),
-        )
-        for layer_idx in sorted(
-            whole_by_layer.keys(), key=lambda idx: (-1 if idx is None else idx)
-        ):
-            attn = whole_by_layer[layer_idx]
-            driver = self._resolve_peak_driver(attn)
-            component_name = (
-                _attn_stage_name(driver.category) if driver is not None else "unknown"
-            )
-            # Growth at the peak location: the driver component's peak growth
-            # (the increment that actually set this layer's peak). Falls back to
-            # the whole-attention scope's own growth when no component is found.
-            growth_mib = (
-                driver.peak_growth_bytes if driver is not None else attn.peak_growth_bytes
-            ) / _MIB
-            logger.warning(
-                "[ACTIVATION_PEAK][PER_LAYER_ATTN] rank=%s layer=%s attn_peak=%.3f GiB "
-                "component=%s growth=%.3f MiB",
-                self.rank,
-                _fmt_layer(layer_idx),
-                attn.peak_bytes / _GIB,
-                component_name,
-                growth_mib,
-            )
-
     def log_summary(self) -> None:
-<<<<<<< HEAD
-        if not self.records and not self.buffers:
-            logger.warning("[ACTIVATION_PEAK][SUMMARY] rank=%s no measured stages", self.rank)
-            return
-
-        category_winners: dict[str, ActivationPeakRecord] = {}
-        for record in self.records:
-            previous = category_winners.get(record.category)
-            if previous is None or record.peak_growth_bytes > previous.peak_growth_bytes:
-                category_winners[record.category] = record
-
-        for category, record in sorted(category_winners.items()):
-            logger.warning(
-                "[ACTIVATION_PEAK][SUMMARY] rank=%s category=%s max_growth=%.3f MiB (%.3f GiB) "
-                "absolute_peak=%.3f GiB label=%s layer=%s tokens=%s",
-=======
         growth_winners: dict[str, ActivationPeakRecord] = {}
         absolute_winners: dict[str, ActivationPeakRecord] = {}
         for record in self.records:
@@ -588,62 +228,17 @@ class ActivationPeakProfiler:
                 "[ACTIVATION_PEAK][SUMMARY] rank=%s mode=%s phase=%s step=%s "
                 "category=%s max_growth=%.3f MiB absolute_peak=%.3f GiB "
                 "label=%s layer=%s tokens=%s",
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
                 self.rank,
                 self.mode,
                 self.phase,
                 self.step,
                 category.upper(),
                 record.peak_growth_bytes / _MIB,
-                record.peak_growth_bytes / _GIB,
                 record.peak_bytes / _GIB,
                 record.label,
                 record.layer_idx,
                 record.num_tokens,
             )
-<<<<<<< HEAD
-
-        buffer_winners: dict[str, ActivationBufferRecord] = {}
-        for record in self.buffers:
-            previous = buffer_winners.get(record.category)
-            if previous is None or record.size_bytes > previous.size_bytes:
-                buffer_winners[record.category] = record
-        for category, record in sorted(buffer_winners.items()):
-            logger.warning(
-                "[ACTIVATION_PEAK][SUMMARY] rank=%s category=%s persistent=%.3f MiB (%.3f GiB) label=%s",
-                self.rank,
-                category.upper(),
-                record.size_bytes / _MIB,
-                record.size_bytes / _GIB,
-                record.label,
-            )
-
-        top_level = [
-            record
-            for category in ("target_model", "mtp_draft")
-            if (record := category_winners.get(category)) is not None
-        ]
-        components = [
-            record for category, record in category_winners.items() if category not in {"target_model", "mtp_draft"}
-        ]
-        dominant_top = max(top_level, key=lambda item: item.peak_growth_bytes, default=None)
-        dominant_activation = max(components, key=lambda item: item.peak_growth_bytes, default=None)
-        dominant_buffer = max(buffer_winners.values(), key=lambda item: item.size_bytes, default=None)
-        if dominant_buffer is not None and (
-            dominant_activation is None or dominant_buffer.size_bytes > dominant_activation.peak_growth_bytes
-        ):
-            dominant_component_category = dominant_buffer.category.upper()
-            dominant_component_kind = "PERSISTENT_BUFFER"
-            dominant_component_bytes = dominant_buffer.size_bytes
-        elif dominant_activation is not None:
-            dominant_component_category = dominant_activation.category.upper()
-            dominant_component_kind = "PEAK_GROWTH"
-            dominant_component_bytes = dominant_activation.peak_growth_bytes
-        else:
-            dominant_component_category = "UNKNOWN"
-            dominant_component_kind = "UNKNOWN"
-            dominant_component_bytes = 0
-=======
         for category, record in sorted(absolute_winners.items()):
             logger.warning(
                 "[ACTIVATION_PEAK][ABS_PEAK] rank=%s mode=%s phase=%s step=%s "
@@ -668,7 +263,6 @@ class ActivationPeakProfiler:
         record = self.overall_peak_record
         if record is not None and record.peak_bytes != self.overall_peak_bytes:
             record = None
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
         logger.warning(
             "[ACTIVATION_PEAK][GLOBAL_PEAK] rank=%s mode=%s phase=%s step=%s "
             "absolute_peak=%.3f GiB peak_bytes=%s location_known=%s "
@@ -688,16 +282,6 @@ class ActivationPeakProfiler:
             record.baseline_bytes if record else None,
             record.peak_growth_bytes if record else None,
         )
-<<<<<<< HEAD
-
-        # Per-layer attention peak breakdown (opt-in), same as the request
-        # summary. log_summary is used by the startup profile_run path.
-        if self.per_layer_attn:
-            attention_records = [
-                record for record in self.records if _is_attention_stage(record.category)
-            ]
-            self._log_per_layer_attn_peaks(attention_records)
-=======
         for buffer in self.buffers:
             logger.warning(
                 "[ACTIVATION_PEAK][SUMMARY] rank=%s category=%s persistent=%.3f MiB label=%s",
@@ -706,7 +290,6 @@ class ActivationPeakProfiler:
                 buffer.size_bytes / _MIB,
                 buffer.label,
             )
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
 
 
 _ACTIVE_PROFILER: ContextVar[ActivationPeakProfiler | None] = ContextVar(
@@ -724,27 +307,16 @@ def activation_peak_profile_session(
     *,
     enabled: bool,
     rank: int,
-<<<<<<< HEAD
-    verbose_stages: bool = True,
-    per_layer_attn: bool = False,
-=======
     mode: str = "profile",
     phase: str = "startup",
     step: int | None = None,
     num_tokens: int | None = None,
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
 ) -> Iterator[ActivationPeakProfiler | None]:
     if not enabled:
         yield None
         return
 
-<<<<<<< HEAD
-    profiler = ActivationPeakProfiler(
-        rank=rank, verbose_stages=verbose_stages, per_layer_attn=per_layer_attn
-    )
-=======
     profiler = ActivationPeakProfiler(rank=rank, mode=mode, phase=phase, step=step, num_tokens=num_tokens)
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
     profiler._synchronize()
     # Startup preserves the historical peak for KV sizing. Serving starts a
     # fresh observation window; RUN_PEAK is maintained separately on the runner.
@@ -776,51 +348,6 @@ def activation_peak_profile_session(
             profiler._scopes.clear()
         if not profiler.failed:
             profiler.log_summary()
-
-
-@contextmanager
-def request_activation_peak_session(
-    *,
-    enabled: bool,
-    rank: int,
-    num_tokens: int,
-    per_layer_attn: bool = False,
-) -> Iterator[None]:
-    """Per-forward activation peak session for real (served) requests.
-
-    Unlike `activation_peak_profile_session` (used by the startup dummy
-    runs), this wraps one real scheduler step and prints the per-category
-    summary exactly once per invocation, without the per-stage detail log.
-    """
-    if not enabled:
-        yield
-        return
-
-    profiler = ActivationPeakProfiler(
-        rank=rank, quiet_stages=True, per_layer_attn=per_layer_attn
-    )
-    profiler._synchronize()
-    profiler.overall_peak_bytes = int(torch.npu.max_memory_allocated())
-    torch.npu.reset_peak_memory_stats()
-    token = _ACTIVE_PROFILER.set(profiler)
-    logger.warning(
-        "[ACTIVATION_PEAK] rank=%s serving-step profiling started (num_tokens=%s); "
-        "NPU synchronization is active and intended only for debugging.",
-        rank,
-        num_tokens,
-    )
-    try:
-        yield
-    finally:
-        profiler._checkpoint()
-        _ACTIVE_PROFILER.reset(token)
-        logger.warning(
-            "[ACTIVATION_PEAK][REQUEST] rank=%s num_tokens=%s absolute_peak=%.3f GiB",
-            rank,
-            num_tokens,
-            profiler.overall_peak_bytes / _GIB,
-        )
-        profiler.log_request_summary()
 
 
 @contextmanager
@@ -864,7 +391,7 @@ def log_ffn_chunk_decision(
 ) -> None:
     """Log one MoE chunking decision inside an activation profile scope."""
     profiler = _ACTIVE_PROFILER.get()
-    if profiler is None or profiler.quiet_stages:
+    if profiler is None:
         return
 
     scope = next(
@@ -931,10 +458,8 @@ def log_mtp_moe_chunk_detail(
 ) -> None:
     """Log raw and dispatched token counts for one MTP MoE chunk."""
     profiler = _ACTIVE_PROFILER.get()
-    if profiler is None or profiler.quiet_stages:
-        return
-    scope = _current_mtp_moe_scope(profiler)
-    if scope is None:
+    scope = _current_mtp_moe_scope(profiler) if profiler is not None else None
+    if profiler is None or scope is None:
         return
 
     logger.warning(
@@ -949,8 +474,6 @@ def log_mtp_moe_chunk_detail(
         raw_end - raw_start,
         "-" if dispatched_tokens is None else dispatched_tokens,
     )
-<<<<<<< HEAD
-=======
 
 
 def record_activation_substage(
@@ -1251,4 +774,3 @@ def _log_serving_peak_step(
             record.label,
             "-" if record.layer_idx is None else record.layer_idx,
         )
->>>>>>> 72e0c3fc79b615e39bed2ad39f2a7adfa7172d1d
