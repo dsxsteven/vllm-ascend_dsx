@@ -14,11 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
 from collections.abc import Iterable
 from copy import copy
 from types import SimpleNamespace
-
-import os
 
 import torch
 import torch_npu
@@ -30,8 +29,6 @@ from vllm.model_executor.layers.fused_moe import FusedMoERouter, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 from vllm.model_executor.utils import replace_parameter
-
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -41,14 +38,17 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.force_eplb import get_force_eplb_topk
+from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
+from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+
+from vllm_ascend.activation_memory import profile_activation, record_activation_substage
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     FusedExpertsResult,
     get_moe_comm_method,
 )
-from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
-from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -609,6 +609,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             quant_type = getattr(method, "quant_type", QuantType.NONE)
         return quant_type
 
+    @profile_activation("moe_route_topk")
     def _select_experts(
         self,
         hidden_states: torch.Tensor,
@@ -683,9 +684,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         # runtime). VLLM_ASCEND_FORCE_LOAD_BALANCE=1 forces it on for real
         # requests too — randomizes routing, outputs become garbage; use
         # only for memory/perf experiments.
-        enable_force_load_balance = _EXTRA_CTX.in_profile_run or os.environ.get(
-            "VLLM_ASCEND_FORCE_LOAD_BALANCE"
-        ) == "1"
+        enable_force_load_balance = _EXTRA_CTX.in_profile_run or os.environ.get("VLLM_ASCEND_FORCE_LOAD_BALANCE") == "1"
 
         lora_context = getattr(self, "_ascend_moe_lora_context", None)
         moe_comm_method = get_moe_comm_method(_EXTRA_CTX.moe_comm_type, self.moe_config)
@@ -694,13 +693,14 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if lora_context is not None:
             sync_lora_context(self.quant_method, lora_context)
 
-        prepare_output = moe_comm_method.prepare(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            # The SP model wrapper already shards and gathers the MoE sequence.
-            replace_allreduce=self.moe_config.is_sequence_parallel,
-            quant_type=self.quant_type,
-        )
+        with record_activation_substage("moe_prepare", num_tokens=hidden_states.shape[0]):
+            prepare_output = moe_comm_method.prepare(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                # The SP model wrapper already shards and gathers the MoE sequence.
+                replace_allreduce=self.moe_config.is_sequence_parallel,
+                quant_type=self.quant_type,
+            )
         hidden_states = prepare_output.hidden_states
         router_logits = prepare_output.router_logits
         mc2_mask = prepare_output.mc2_mask
@@ -755,11 +755,12 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 self.moe_load.add_(local_load)
 
         assert _EXTRA_CTX.moe_comm_method is not None
-        routed_out = _EXTRA_CTX.moe_comm_method.finalize(
-            hidden_states=fused_experts_results.routed_out,
-            reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
-            padded_hidden_states_shape=padded_hidden_states_shape,
-        )
+        with record_activation_substage("moe_finalize", num_tokens=fused_experts_results.routed_out.shape[0]):
+            routed_out = _EXTRA_CTX.moe_comm_method.finalize(
+                hidden_states=fused_experts_results.routed_out,
+                reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
+                padded_hidden_states_shape=padded_hidden_states_shape,
+            )
 
         # Clear per-forward LoRA state from long-lived singletons.
         if lora_context is not None:

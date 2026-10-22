@@ -27,9 +27,6 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec
-
-from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
-from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
@@ -48,6 +45,14 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTask,
     wait_for_device_metadata,
 )
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    log_activation_skip,
+    profile_activation,
+    record_activation_substage,
+)
+from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 
 V41_METADATA_BUFFER_SIZE = 1024
 
@@ -316,6 +321,7 @@ class AscendDSAV41Impl:
         )
 
     @classmethod
+    @profile_activation("attn_q_proj")
     def _project_q(cls, attn, hidden_states, cos, sin):
         qr = attn.q_norm(attn.wq_a(hidden_states))
         q = attn.wq_b(qr).unflatten(-1, (-1, attn.head_dim))
@@ -323,6 +329,7 @@ class AscendDSAV41Impl:
         return q.to(hidden_states.dtype), qr
 
     @classmethod
+    @profile_activation("attn_kv_proj")
     def _project_kv(cls, attn, hidden_states, cos, sin):
         kv = attn.kv_norm(attn.wkv(hidden_states)).view(-1, 1, attn.head_dim)
         cls._apply_rotary(attn, kv, cos, sin)
@@ -679,6 +686,7 @@ class AscendDSAV41Impl:
             output = torch.empty_like(hidden_states)
         forward_context = get_forward_context()
         if forward_context.attn_metadata is None:
+            log_activation_skip("attention", "no_attention_metadata")
             output.zero_()
             return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
@@ -695,8 +703,8 @@ class AscendDSAV41Impl:
             positions = metadata.positions[:num_tokens]
             cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
             qkv_ctx = (
-                record_activation_peak(
-                    "target_attn_qkv_proj",
+                record_activation_substage(
+                    "attn_qkv_proj",
                     f"{scope_label}.attn.qkv_proj",
                     layer_idx=layer_idx,
                     num_tokens=num_tokens_for_scope,
@@ -707,8 +715,8 @@ class AscendDSAV41Impl:
             with qkv_ctx:
                 q, qr = self._prepare_queries(attn, hidden_states, positions, cos, sin, metadata)
             indexer_ctx = (
-                record_activation_peak(
-                    "target_attn_indexer",
+                record_activation_substage(
+                    "attn_indexer",
                     f"{scope_label}.attn.indexer",
                     layer_idx=layer_idx,
                     num_tokens=num_tokens_for_scope,
@@ -720,8 +728,8 @@ class AscendDSAV41Impl:
                 prepared_indexer = self._prepare_indexer_inputs(attn, hidden_states, qr, cos, sin, metadata)
                 if self.role.is_kv_source:
                     compressor_ctx = (
-                        record_activation_peak(
-                            "target_attn_compressor",
+                        record_activation_substage(
+                            "attn_compressor",
                             f"{scope_label}.attn.compressor",
                             layer_idx=layer_idx,
                             num_tokens=num_tokens_for_scope,
@@ -739,8 +747,8 @@ class AscendDSAV41Impl:
                     attn, hidden_states, qr, positions, cos, sin, metadata, prepared_indexer
                 )
             sfa_ctx = (
-                record_activation_peak(
-                    "target_attn_sfa",
+                record_activation_substage(
+                    "attn_sfa",
                     f"{scope_label}.attn.sfa",
                     layer_idx=layer_idx,
                     num_tokens=num_tokens_for_scope,
@@ -755,8 +763,8 @@ class AscendDSAV41Impl:
             heads = attn.n_heads if getattr(attn, "enable_dsa_cp", False) else attn.n_local_heads
             attention_output = hidden_states.new_empty((0, heads, attn.head_dim))
         o_proj_ctx = (
-            record_activation_peak(
-                "target_attn_o_proj",
+            record_activation_substage(
+                "attn_o_proj",
                 f"{scope_label}.attn.o_proj",
                 layer_idx=layer_idx,
                 num_tokens=num_tokens_for_scope,

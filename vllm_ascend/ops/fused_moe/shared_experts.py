@@ -24,8 +24,6 @@ from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_para
 from vllm.logger import logger
 from vllm.model_executor.layers.activation import SituAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodBase
-
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.lora.fused_moe import has_lora
@@ -36,6 +34,9 @@ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
 from vllm_ascend.ops.fused_moe.moe_utils import _pad_tokens_with_cat
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
+
+from vllm_ascend.activation_memory import profile_activation
+from vllm_ascend.ascend_config import get_ascend_config
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
@@ -556,6 +557,7 @@ class AscendSharedExperts:
         # assigned inside that op is not available while its fake path traces.
         torch.npu.current_stream().wait_stream(shared_experts_calculation_stream())
 
+    @profile_activation("moe_shared_expert")
     def forward(
         self,
         prepared_input: PreparedSharedExpertInput,

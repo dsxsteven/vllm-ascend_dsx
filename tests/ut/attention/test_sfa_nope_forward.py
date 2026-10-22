@@ -6,9 +6,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from vllm.config.compilation import CUDAGraphMode
-
 import vllm_ascend.attention.sfa_v1 as sparse_mla
+from vllm.config.compilation import CUDAGraphMode
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata
 
 
@@ -21,6 +20,9 @@ def mock_scatter_nd_update(monkeypatch):
         return cache
 
     monkeypatch.setattr(sparse_mla.torch_npu, "npu_scatter_nd_update_", scatter, raising=False)
+    # Other tests may register the native SK operator before this CPU test runs.
+    # Keep both cache-scatter dispatch paths on the same CPU reference.
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_scatter_nd_update_sk", scatter, raising=False)
 
 
 @pytest.mark.parametrize("block_size", [128, 640])

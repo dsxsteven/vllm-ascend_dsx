@@ -18,10 +18,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import (
     get_dsa_attn_kv_plan,
@@ -62,9 +59,15 @@ from vllm_ascend.worker.device_metadata import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    profile_activation,
+    record_activation_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms
 
 if HAS_TRITON:
@@ -102,6 +105,7 @@ def get_or_compute_compressor_metadata(
     metadata: Any,
     compress_ratio: int,
     vllm_config: VllmConfig,
+    chunk: Any | None = None,
 ) -> CompressorMetadataOutput:
     """Compute the DSV4 compressor metadata once per cache group in the current substep.
 
@@ -109,26 +113,38 @@ def get_or_compute_compressor_metadata(
     layer in a cache group consumes the same compressor metadata. The outputs are
     therefore memoized on the current forward context so the device-side
     ``compressor_metadata`` operator runs only once per group.
+
+    When ``chunk`` (a :class:`DSAChunkMeta`) is passed, the operator runs on the
+    chunk's rebased cu_seqlens/start_pos and produces only the chunk's compressed
+    rows; the memo key is qualified by the chunk index so per-chunk outputs never
+    collide with the full-batch entry or each other.
     """
     cache_group_key = getattr(metadata, "cache_group_key", "")
     if not cache_group_key:
         raise ValueError(
             "DSV4 compressor metadata requires a cache group key; the AscendDSAReqMetadata builder did not set one"
         )
+    memo_key = cache_group_key if chunk is None else f"{cache_group_key}:chunk{chunk.geometry.index}"
     forward_context = get_forward_context()
     cache: dict[str, CompressorMetadataOutput] = forward_context.additional_kwargs.setdefault(
         _COMPRESSOR_METADATA_CACHE_KEY,
         {},
     )
-    cached_metadata = cache.get(cache_group_key)
+    cached_metadata = cache.get(memo_key)
     if cached_metadata is not None:
         return cached_metadata
 
     assert metadata.full_compress_cos is not None
     assert metadata.full_compress_sin is not None
-    assert metadata.num_compressed_tokens is not None
     assert metadata.start_pos is not None
     assert metadata.num_actual_reqs is not None
+    if chunk is None:
+        assert metadata.num_compressed_tokens is not None
+    num_compressed_tokens = (
+        chunk.geometry.num_compressed_tokens_k if chunk is not None else metadata.num_compressed_tokens
+    )
+    query_start_loc = chunk.qsl_k if chunk is not None else metadata.query_start_loc
+    start_pos = chunk.start_pos_k if chunk is not None else metadata.start_pos
     full_compress_cos = metadata.full_compress_cos.view(
         metadata.full_compress_cos.shape[0],
         metadata.full_compress_cos.shape[-1],
@@ -140,16 +156,16 @@ def get_or_compute_compressor_metadata(
     computed_metadata = torch.ops._C_ascend.compressor_metadata(
         full_compress_cos,
         full_compress_sin,
-        metadata.query_start_loc,
-        metadata.start_pos,
+        query_start_loc,
+        start_pos,
         metadata.block_table,
         metadata.storage_block_size,
         get_dsa_attn_kv_plan(vllm_config).get_dsa_compressor_slot_mapping_format(),
         compress_ratio,
-        metadata.num_compressed_tokens,
+        num_compressed_tokens,
         metadata.num_actual_reqs,
     )
-    cache[cache_group_key] = computed_metadata
+    cache[memo_key] = computed_metadata
     return computed_metadata
 
 
@@ -371,6 +387,10 @@ class AscendDSAReqMetadata:
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
+    # DSA-CP attention chunking plan (enable_attention_chunking, ratio-4
+    # prefill steps only). Shared geometry plus this cache group's per-chunk
+    # SAS/QLI metadata; see vllm_ascend/attention/dsa_chunking.py.
+    chunks: Any | None = None
 
 
 @dataclass
@@ -1855,7 +1875,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             # captured by the ACL graph.  Non-OTP just zeros the output.
             if oproj_tp_enable() or self.enable_pcp_o_proj_weight_sharding:
                 o_proj_input = hidden_states.new_zeros(o_proj_input_shape)
-                self._forward_o_proj(o_proj_input, output)
+                with record_activation_substage("attn_o_proj", f"{layer_name}.attn.o_proj"):
+                    self._forward_o_proj(o_proj_input, output)
             else:
                 output.fill_(0)
             return output
@@ -1876,8 +1897,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         profiling = is_activation_peak_profiling()
         scope_label = layer_name
         sfa_ctx = (
-            record_activation_peak(
-                "target_attn_sfa",
+            record_activation_substage(
+                "attn_body",
                 f"{scope_label}.attn.sfa",
                 num_tokens=actual_tokens,
             )
@@ -1910,7 +1931,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             cos = req_metadata.cos[layer_name]
             sin = req_metadata.sin[layer_name]
 
-            negate_sin = get_current_hardware_profile().supports(HardwareCapability.INPLACE_PARTIAL_ROTARY_MUL_NEGATE_SIN)
+            negate_sin = get_current_hardware_profile().supports(
+                HardwareCapability.INPLACE_PARTIAL_ROTARY_MUL_NEGATE_SIN
+            )
             sin_arg = sin[:actual_tokens] if negate_sin else -sin[:actual_tokens]
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 o_proj_input[:actual_tokens].unsqueeze(1),
@@ -1923,8 +1946,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         # o
         o_proj_ctx = (
-            record_activation_peak(
-                "target_attn_o_proj",
+            record_activation_substage(
+                "attn_o_proj",
                 f"{scope_label}.attn.o_proj",
                 num_tokens=actual_tokens,
             )
@@ -1937,6 +1960,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         return output_padded
 
+    @profile_activation("attn_qkv_proj")
     def _mla_prolog_single_stream(
         self,
         hidden_states,
@@ -2384,6 +2408,6 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         if self.turboquant is not None:
             q = self.turboquant.forward(q)
-        with attention_transfer_window():
+        with attention_transfer_window(), record_activation_substage("attn_sfa"):
             result = attn_op(q, **attn_kwargs)[0]
         return self.turboquant.inverse(result) if self.turboquant is not None else result
