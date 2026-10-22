@@ -27,7 +27,6 @@ from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
-
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
@@ -568,8 +567,9 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -581,6 +581,15 @@ class AscendConfig:
     ffn_chunk_size: int = 4096
     """Token chunk size for MoE FFN chunking when ``enable_ffn_chunking`` is
     set. Must be positive."""
+    enable_attention_chunking: bool = False
+    """Opt in to DSA-CP sparse attention token chunking for prefill steps
+    (q prolog + KV/indexer/compressor cache writes + top-k + sparse
+    attention run per token chunk to cap attention activation memory).
+    Requires ``enforce_eager=true`` and ``enable_dsa_cp=true`` (compress
+    ratio 4 models only). See ``attention_chunk_size``."""
+    attention_chunk_size: int = 8192
+    """Global token chunk size for attention chunking when
+    ``enable_attention_chunking`` is set. Must be positive."""
     activation_peak_debug: bool = False
     """Enable scoped activation-memory peak logging during profile_run.
     Covers the full forward (embedding/hc-expand/layer/attention/MoE/
@@ -589,26 +598,21 @@ class AscendConfig:
     Interpretation guide: see the ``vllm_ascend.activation_memory`` module
     docstring (log levels, SUMMARY share-of-target_model semantics, caveats).
     Requires ``enforce_eager=true``."""
+    activation_peak_debug_serving: bool = False
+    """Also profile real eager forward and sampling, with synchronized substage measurements."""
+    activation_peak_debug_max_steps: int = 0
+    """Maximum serving steps to profile per rank; 0 means unlimited."""
     activation_peak_debug_rank: int = 0
     """Rank that logs activation peaks: -1 for all ranks, else one rank id."""
-    activation_peak_serving: bool = False
-    """Per-request activation-peak profiling during real request serving
-    (not just the startup profile_run). When set, each served prefill
-    forward is wrapped in ``request_activation_peak_session`` and prints a
-    ``[ACTIVATION_PEAK][REQUEST_SUMMARY]`` block: the step's absolute
-    memory peak and the component that drove it (moe/attn q_proj/sfa/
-    o_proj/...), the attention peak with its driving component, and the
-    per-component attention breakdown (peak + growth) plus the peak
-    decomposition (growth + carried baseline). Requires
-    ``activation_peak_debug`` and ``enforce_eager=true`` (the session
-    synchronizes every scope and resets the allocator peak per step, which
-    would break ACL graph capture/replay). The lightweight
-    ``[SERVING_MEMORY][STEP]`` log is suppressed when this is on."""
-    activation_peak_per_layer: bool = False
-    """Print one ``[ACTIVATION_PEAK][PER_LAYER_ATTN]`` line per attention
-    layer (that layer's absolute attention peak, the component that drove
-    it, and the growth at that component) in addition to the single
-    global attn-peak line. Requires ``activation_peak_debug``."""
+    serving_peak_debug: bool = False
+    """Compatibility switch for synchronized serving forward AND sampling
+    diagnostics. Uses serving_peak_debug_rank, respects
+    activation_peak_debug_max_steps, and requires enforce_eager=true.
+    ABS_PEAK pairs each absolute peak with its own baseline/growth;
+    GLOBAL_PEAK identifies the actual measured leaf or explicitly UNKNOWN."""
+    serving_peak_debug_rank: int = 0
+    """Rank that logs serving per-step peaks: -1 for all ranks, else one
+    rank id."""
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -935,6 +939,20 @@ class AscendConfig:
         # ---- ported FFN chunking / activation-peak-debug cross-config checks ----
         # (type validation of these fields is handled by pydantic at
         #  construction time; only cross-config checks live here)
+        if self.activation_peak_debug_max_steps < 0:
+            raise ValueError("activation_peak_debug_max_steps must be non-negative")
+        if self.serving_peak_debug:
+            self.activation_peak_debug_serving = True
+        if self.activation_peak_debug_serving:
+            self.activation_peak_debug = True
+        if self.activation_peak_debug:
+            if self.multistream_overlap_shared_expert or self.multistream_dsv4_dsa_overlap:
+                logger.warning_once(
+                    "Activation memory diagnostics serialize shared experts and DSA overlap; "
+                    "measured latency is diagnostic, not production performance."
+                )
+            self.multistream_overlap_shared_expert = False
+            self.multistream_dsv4_dsa_overlap = False
         if self.activation_peak_debug_rank < -1:
             raise ValueError(
                 "activation_peak_debug_rank must be -1 (all ranks) or a non-negative rank, got "
@@ -949,26 +967,19 @@ class AscendConfig:
                 "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
             )
 
-        if self.activation_peak_serving and not self.activation_peak_debug:
+        if self.serving_peak_debug_rank < -1:
             raise ValueError(
-                "activation_peak_serving requires activation_peak_debug to be enabled as well."
+                "serving_peak_debug_rank must be -1 (all ranks) or a non-negative rank, got "
+                f"{self.serving_peak_debug_rank}"
             )
-        if self.activation_peak_serving and not getattr(
-            vllm_config.model_config, "enforce_eager", False
-        ):
-            raise ValueError(
-                "activation_peak_serving requires eager mode; set enforce_eager=true."
-            )
-        if self.activation_peak_serving:
+        if self.serving_peak_debug and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("serving_peak_debug requires eager mode; set enforce_eager=true.")
+        if self.serving_peak_debug:
             logger.warning_once(
-                "Activation peak debugging is enabled for serving on rank %s. "
-                "NPU synchronization on every serving step will add real latency; "
+                "Serving per-step peak debugging is enabled on rank %s. "
+                "Two NPU synchronizes per scope per step will add real serving latency; "
                 "the lightweight [SERVING_MEMORY][STEP] log is suppressed in this mode.",
-                "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
-            )
-        if self.activation_peak_per_layer and not self.activation_peak_debug:
-            raise ValueError(
-                "activation_peak_per_layer requires activation_peak_debug to be enabled as well."
+                "all" if self.serving_peak_debug_rank == -1 else self.serving_peak_debug_rank,
             )
 
         if self.ffn_chunk_size <= 0:
@@ -976,18 +987,29 @@ class AscendConfig:
         # FFN chunking is an explicit opt-in. Do not infer the Attention
         # implementation from model-specific fields such as ``index_topk`` or
         # ``compress_ratios``; deployment configuration owns that decision.
-        if self.enable_ffn_chunking and not getattr(
-            vllm_config.model_config, "enforce_eager", False
-        ):
-            raise ValueError(
-                "enable_ffn_chunking currently requires eager mode; "
-                "set enforce_eager=true."
-            )
+        if self.enable_ffn_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("enable_ffn_chunking currently requires eager mode; set enforce_eager=true.")
         if self.enable_ffn_chunking:
             logger.info_once(
-                "[fused_moe] MoE FFN token chunking is enabled for routed experts: "
-                "chunk_size=%s.",
+                "[fused_moe] MoE FFN token chunking is enabled for routed experts: chunk_size=%s.",
                 self.ffn_chunk_size,
+            )
+
+        if self.attention_chunk_size <= 0:
+            raise ValueError(f"attention_chunk_size must be positive, got {self.attention_chunk_size}")
+        # Attention chunking re-runs the DSA-CP stage list per token chunk with
+        # chunk-local metadata, so it shares the FFN chunking eager-mode scope.
+        if self.enable_attention_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("enable_attention_chunking currently requires eager mode; set enforce_eager=true.")
+        if self.enable_attention_chunking:
+            if not self.enable_dsa_cp:
+                logger.warning_once(
+                    "enable_attention_chunking only takes effect on the DSA-CP attention "
+                    "path (enable_dsa_cp=true, compress ratio 4); it is ignored otherwise."
+                )
+            logger.info_once(
+                "[attention] DSA-CP attention token chunking is enabled for prefill: chunk_size=%s.",
+                self.attention_chunk_size,
             )
 
         # enable_kv_nz preconditions

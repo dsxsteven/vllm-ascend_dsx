@@ -626,6 +626,75 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_attention_chunking_is_enabled_by_explicit_config(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        model_config = self._make_model_config(is_deepseek_mla=True)
+        model_config.enforce_eager = True
+        model_config.hf_config = SimpleNamespace(index_topk=512, compress_ratios=[4])
+        model_config.hf_text_config = model_config.hf_config
+        test_vllm_config.model_config = model_config
+        test_vllm_config.additional_config = {
+            "enable_attention_chunking": True,
+            "attention_chunk_size": 4096,
+            "enable_dsa_cp": True,
+            "refresh": True,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.enable_attention_chunking)
+        self.assertEqual(ascend_config.attention_chunk_size, 4096)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_attention_chunking_defaults_off(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.model_config = self._make_model_config()
+        test_vllm_config.additional_config = {"refresh": True}
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertFalse(ascend_config.enable_attention_chunking)
+        self.assertEqual(ascend_config.attention_chunk_size, 8192)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_attention_chunking_rejects_graph_mode(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        model_config = self._make_model_config(is_deepseek_mla=True)
+        model_config.enforce_eager = False
+        model_config.hf_config = SimpleNamespace(index_topk=512, compress_ratios=[4])
+        model_config.hf_text_config = model_config.hf_config
+        test_vllm_config.model_config = model_config
+        test_vllm_config.additional_config = {"enable_attention_chunking": True, "refresh": True}
+
+        with self.assertRaisesRegex(ValueError, "requires eager mode"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_attention_chunking_rejects_invalid_size(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        model_config = self._make_model_config(is_deepseek_mla=True)
+        model_config.enforce_eager = True
+        model_config.hf_config = SimpleNamespace(index_topk=512, compress_ratios=[4])
+        model_config.hf_text_config = model_config.hf_config
+        test_vllm_config.model_config = model_config
+
+        for additional_config, error_pattern in [
+            ({"attention_chunk_size": 1.5}, "Input should be a valid integer"),
+            ({"attention_chunk_size": 0}, "must be positive"),
+            ({"attention_chunk_size": -8192}, "must be positive"),
+        ]:
+            test_vllm_config.additional_config = {**additional_config, "refresh": True}
+            with self.subTest(additional_config=additional_config), self.assertRaisesRegex(
+                ValueError, error_pattern
+            ):
+                init_ascend_config(test_vllm_config)
+            clear_ascend_config()
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_enable_npugraph_ex(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {

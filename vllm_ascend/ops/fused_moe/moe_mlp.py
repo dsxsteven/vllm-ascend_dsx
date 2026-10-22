@@ -18,10 +18,11 @@
 import torch
 import torch_npu
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+
+from vllm_ascend.activation_memory import record_activation_substage
 
 
 def apply_moe_mlp(
@@ -46,14 +47,19 @@ def apply_moe_mlp(
             )
 
     if quant_method.supports_fused_activation(mlp_compute_input.activation):
-        hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
+        with record_activation_substage("moe_gmm1_act_quant"):
+            hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
     else:
-        hidden_states = quant_method.apply_gmm1(mlp_compute_input)
-        hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
-        hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
+        with record_activation_substage("moe_gmm1"):
+            hidden_states = quant_method.apply_gmm1(mlp_compute_input)
+        with record_activation_substage("moe_activation"):
+            hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
+        with record_activation_substage("moe_activation_quant"):
+            hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
 
     before_gmm2_evt = torch.npu.current_stream().record_event()
-    hidden_states = quant_method.apply_gmm2(mlp_compute_input, hidden_states, act_out_scale)
+    with record_activation_substage("moe_gmm2"):
+        hidden_states = quant_method.apply_gmm2(mlp_compute_input, hidden_states, act_out_scale)
     return hidden_states, before_gmm2_evt
 
 
