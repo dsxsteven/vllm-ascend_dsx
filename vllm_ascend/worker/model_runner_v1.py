@@ -238,6 +238,7 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.activation_memory import (
     ActivationPeakProfiler,
     activation_peak_profile_session,
+    log_serving_peak_request_topk,
     profile_runner_phase,
     record_activation_buffer,
     record_activation_peak,
@@ -2833,6 +2834,8 @@ class NPUModelRunner(GPUModelRunner):
         if self.dynamic_eplb:
             self.eplb_updator.forward_end(self.eplb_heat_collection_status)
 
+        self._maybe_log_serving_peak_request_topk(scheduler_output)
+
         self._finalize_dump_data()
 
         if self.need_accepted_tokens:
@@ -4499,6 +4502,35 @@ class NPUModelRunner(GPUModelRunner):
             self._debugger_started = False
 
         self.debugger.step(**kwargs)
+
+    def _maybe_log_serving_peak_request_topk(self, scheduler_output) -> None:
+        """Log top-K absolute serving activation peaks when a request finishes.
+
+        Gated by ``ascend_config.serving_peak_request_topk``; reads the
+        cumulative RUN_PEAK profiler (``_activation_peak_run_result``) updated
+        by ``profile_runner_phase``. No-op when serving diagnostics are off or
+        no request finished in this step.
+        """
+        topk = int(getattr(self.ascend_config, "serving_peak_request_topk", 0))
+        if topk <= 0:
+            return
+        finished = getattr(scheduler_output, "finished_req_ids", None)
+        if not finished:
+            return
+        run_result = getattr(self, "_activation_peak_run_result", None)
+        if run_result is None:
+            return
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        log_serving_peak_request_topk(
+            rank=rank,
+            topk=topk,
+            finished_req_ids=finished,
+            run_result=run_result,
+        )
 
     def initialize_kv_cache(
         self,

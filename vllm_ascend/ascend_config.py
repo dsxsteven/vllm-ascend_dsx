@@ -616,6 +616,12 @@ class AscendConfig:
     serving_peak_debug_rank: int = 0
     """Rank that logs serving per-step peaks: -1 for all ranks, else one
     rank id."""
+    serving_peak_request_topk: int = 0
+    """When > 0 and serving activation diagnostics are enabled, log the top-K
+    absolute activation peaks (with their pinning scope) once a request
+    finishes (i.e. when scheduler_output.finished_req_ids is non-empty). The
+    ranking uses the cumulative RUN_PEAK profiler records collected across all
+    serving steps so far. 0 disables this end-of-request summary."""
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -966,6 +972,17 @@ class AscendConfig:
                 "Two NPU synchronizes per scope per step will add real serving latency; "
                 "the lightweight [SERVING_MEMORY][STEP] log is suppressed in this mode.",
                 "all" if self.serving_peak_debug_rank == -1 else self.serving_peak_debug_rank,
+            )
+
+        if self.serving_peak_request_topk < 0:
+            raise ValueError("serving_peak_request_topk must be non-negative")
+        if self.serving_peak_request_topk and not (
+            self.activation_peak_debug_serving or self.serving_peak_debug
+        ):
+            logger.warning_once(
+                "serving_peak_request_topk is set but no serving activation diagnostic "
+                "(activation_peak_debug_serving/serving_peak_debug) is enabled; "
+                "end-of-request top-K peak logging will be inactive."
             )
 
         if self.ffn_chunk_size <= 0:

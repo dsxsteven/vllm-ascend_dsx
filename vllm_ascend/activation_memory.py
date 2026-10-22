@@ -654,6 +654,66 @@ def profile_runner_phase(phase: str):
     return decorate
 
 
+def log_serving_peak_request_topk(
+    *,
+    rank: int,
+    topk: int,
+    finished_req_ids,
+    run_result,
+) -> None:
+    """Emit the top-K absolute activation peaks observed across serving so far.
+
+    Called when a request finishes (``finished_req_ids`` is non-empty). Ranks
+    the cumulative records of the monotonic RUN_PEAK profiler (``run_result``,
+    maintained by ``profile_runner_phase`` on each runner) by absolute
+    ``peak_bytes`` and logs the largest ``topk`` with the scope that pinned
+    each peak. No-op when ``topk <= 0`` or no profiler/records exist.
+    """
+    if topk <= 0 or run_result is None:
+        return
+    records = getattr(run_result, "records", None)
+    if not records:
+        return
+    # Deduplicate by (category, label, layer) keeping the largest absolute peak,
+    # then rank by peak_bytes descending.
+    best: dict[tuple, ActivationPeakRecord] = {}
+    for record in records:
+        key = (record.category, record.label, record.layer_idx)
+        prev = best.get(key)
+        if prev is None or record.peak_bytes > prev.peak_bytes:
+            best[key] = record
+    ranked = sorted(best.values(), key=lambda r: r.peak_bytes, reverse=True)
+    top = ranked[:topk]
+    if not top:
+        return
+    req_ids_str = ",".join(sorted(str(r) for r in finished_req_ids))
+    logger.warning(
+        "[SERVING_MEMORY][REQ_TOPK] rank=%s finished_req_ids=%s topk=%s "
+        "run_peak=%.3f GiB ranked_scopes=%s",
+        rank,
+        req_ids_str or "-",
+        len(top),
+        run_result.overall_peak_bytes / _GIB,
+        len(ranked),
+    )
+    for i, record in enumerate(top, start=1):
+        logger.warning(
+            "[SERVING_MEMORY][REQ_TOPK_ENTRY] rank=%s idx=%s/%s "
+            "absolute_peak=%.3f GiB growth=%.3f MiB baseline=%.3f GiB "
+            "component=%s label=%s layer=%s tokens=%s",
+            rank,
+            i,
+            len(top),
+            record.peak_bytes / _GIB,
+            record.peak_growth_bytes / _MIB,
+            record.baseline_bytes / _GIB,
+            _component_display_name(record.category),
+            record.label,
+            "-" if record.layer_idx is None else record.layer_idx,
+            "-" if record.num_tokens is None else record.num_tokens,
+        )
+
+
 def serving_memory_log_step(*, rank: int, phase: str, num_tokens: int | None) -> None:
     """Lightweight snapshot; allocator_peak is since the latest reset, not process start."""
     profiler = _ACTIVE_PROFILER.get()

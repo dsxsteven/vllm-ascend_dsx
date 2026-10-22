@@ -121,6 +121,7 @@ from vllm_ascend.worker.v2.utils import (
 from vllm_ascend.activation_memory import (
     ActivationPeakProfiler,
     activation_peak_profile_session,
+    log_serving_peak_request_topk,
     profile_runner_phase,
     record_activation_buffer,
     record_activation_peak,
@@ -346,10 +347,17 @@ class NPUModelRunner(GPUModelRunner):
         if pcp_manager is not None and isinstance(pcp_manager, AscendPCPManager):
             pcp_manager._sampling_hidden_restored = False
         self._restore_replicated_draft_target_states()
+        scheduler_output = (
+            self.execute_model_state.scheduler_output
+            if self.execute_model_state is not None
+            else None
+        )
         output = super().sample_tokens(grammar_output)
         if self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
             self.pp_handler.broadcast_drafts()
+        if scheduler_output is not None:
+            self._maybe_log_serving_peak_request_topk(scheduler_output)
         return output
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -641,6 +649,35 @@ class NPUModelRunner(GPUModelRunner):
         if configured == -1:
             return global_rank
         return global_rank if global_rank == configured else None
+
+    def _maybe_log_serving_peak_request_topk(self, scheduler_output) -> None:
+        """Log top-K absolute serving activation peaks when a request finishes.
+
+        Gated by ``ascend_config.serving_peak_request_topk``; reads the
+        cumulative RUN_PEAK profiler (``_activation_peak_run_result``) updated
+        by ``profile_runner_phase``. No-op when serving diagnostics are off or
+        no request finished in this step.
+        """
+        topk = int(getattr(self.ascend_config, "serving_peak_request_topk", 0))
+        if topk <= 0:
+            return
+        finished = getattr(scheduler_output, "finished_req_ids", None)
+        if not finished:
+            return
+        run_result = getattr(self, "_activation_peak_run_result", None)
+        if run_result is None:
+            return
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        log_serving_peak_request_topk(
+            rank=rank,
+            topk=topk,
+            finished_req_ids=finished,
+            run_result=run_result,
+        )
 
     @torch.inference_mode()
     def profile_run(self) -> None:
