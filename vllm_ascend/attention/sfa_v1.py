@@ -62,6 +62,7 @@ from vllm_ascend.quantization.methods import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
 from vllm_ascend.quantization.methods.kv_cache.turboquant.latent import TurboQuantLatent
+from vllm_ascend.activation_memory import record_activation_substage
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
     ACL_FORMAT_FRACTAL_NZ,
@@ -1959,146 +1960,148 @@ class AscendSFAImpl(MLAAttentionImpl):
         # eager-mode PyTorch. Even view and slice operations can add CPU
         # overhead without launching NPU kernels. Minimize PyTorch operations
         # in this method and benchmark changes to avoid regressions.
-        if fused_type == PreprocessType.NATIVE:
-            hidden_states = self._prepare_native_hidden_states(hidden_states, attn_metadata)
+        with record_activation_substage("attn_qkv_proj", f"{layer_name}.attn.qkv_proj"):
+            if fused_type == PreprocessType.NATIVE:
+                hidden_states = self._prepare_native_hidden_states(hidden_states, attn_metadata)
 
-        # Inputs and outputs may contain DP or graph padding. Keep the
-        # preallocated output for the caller while running attention only on
-        # the token rows described by metadata, matching upstream backends.
-        hidden_states = hidden_states[:num_input_tokens]
-        if gate_hidden_states is not None:
-            gate_hidden_states = gate_hidden_states[:num_input_tokens]
+            # Inputs and outputs may contain DP or graph padding. Keep the
+            # preallocated output for the caller while running attention only on
+            # the token rows described by metadata, matching upstream backends.
+            hidden_states = hidden_states[:num_input_tokens]
+            if gate_hidden_states is not None:
+                gate_hidden_states = gate_hidden_states[:num_input_tokens]
 
-        if fused_type != PreprocessType.NATIVE:
-            # Keep the raw hidden states for the indexer's k path: the fused
-            # preprocess below returns new tensors and does not modify this
-            # one in place.
-            k_hidden_states = hidden_states if self.runtime_has_indexer else None
-            wait_for_kv_layer_from_connector(layer_name)
-            if self.layerwise_kv_cache_hook is not None:
-                # The fused preprocess is the first operation that may read or
-                # update the paged SFA and LI caches.
-                self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
+            if fused_type != PreprocessType.NATIVE:
+                # Keep the raw hidden states for the indexer's k path: the fused
+                # preprocess below returns new tensors and does not modify this
+                # one in place.
+                k_hidden_states = hidden_states if self.runtime_has_indexer else None
+                wait_for_kv_layer_from_connector(layer_name)
+                if self.layerwise_kv_cache_hook is not None:
+                    # The fused preprocess is the first operation that may read or
+                    # update the paged SFA and LI caches.
+                    self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
 
-            if fused_type == PreprocessType.PROLOG_V3:
-                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_prolog_v3(
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    cos=cos,
-                    sin=sin,
-                    # npu_mla_prolog_v3 requires int64 cache indices; reuse
-                    # the per-step conversion so all layers of a step share
-                    # one Cast kernel (the .to() inside is a no-op on int64).
-                    slot_mapping=_int64_kv_slots(slot_mapping_sfa, attn_metadata),
-                    attn_metadata=attn_metadata,
-                )
+                if fused_type == PreprocessType.PROLOG_V3:
+                    hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_prolog_v3(
+                        hidden_states=hidden_states,
+                        kv_cache=kv_cache,
+                        cos=cos,
+                        sin=sin,
+                        # npu_mla_prolog_v3 requires int64 cache indices; reuse
+                        # the per-step conversion so all layers of a step share
+                        # one Cast kernel (the .to() inside is a no-op on int64).
+                        slot_mapping=_int64_kv_slots(slot_mapping_sfa, attn_metadata),
+                        attn_metadata=attn_metadata,
+                    )
+                else:
+                    hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_mlapo(
+                        hidden_states=hidden_states,
+                        kv_cache=kv_cache,
+                        cos=cos,
+                        sin=sin,
+                        slot_mapping=slot_mapping_sfa,
+                        num_input_tokens=num_input_tokens,
+                        attn_metadata=attn_metadata,
+                    )
+            # native
             else:
-                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_mlapo(
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    cos=cos,
-                    sin=sin,
-                    slot_mapping=slot_mapping_sfa,
-                    num_input_tokens=num_input_tokens,
-                    attn_metadata=attn_metadata,
+                assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c, kv_no_split = qkv_lora.split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
                 )
-        # native
-        else:
-            assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_no_split = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-            assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
-            q_c = self.q_a_layernorm(q_c)
+                assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
+                q_c = self.q_a_layernorm(q_c)
 
-            # The prepared hidden states feed the indexer's k path (same stage
-            # as the weights path input).
-            k_hidden_states = hidden_states if self.runtime_has_indexer else None
+                # The prepared hidden states feed the indexer's k path (same stage
+                # as the weights path input).
+                k_hidden_states = hidden_states if self.runtime_has_indexer else None
 
-            wait_for_kv_layer_from_connector(layer_name)
-            if self.layerwise_kv_cache_hook is not None:
-                # Q/KV projections above overlap the full-layer broadcast.
-                # Wait before the first main or indexer cache access.
-                self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
+                wait_for_kv_layer_from_connector(layer_name)
+                if self.layerwise_kv_cache_hook is not None:
+                    # Q/KV projections above overlap the full-layer broadcast.
+                    # Wait before the first main or indexer cache access.
+                    self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
 
-            kv_outputs = self.exec_kv(
-                kv_no_split,
-                cos,
-                sin,
-                kv_cache,
-                parallel_context.kv_slot_mapping,
-                attn_metadata,
-            )
-            k_pe, k_nope = kv_outputs[:2]
-            knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
-            # k_li no longer exists at this point: it is computed by
-            # indexer.forward_k below and gathered at cache-write time, so
-            # the fused gather below only carries the main KV.
-            fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
-                k_pe,
-                k_nope,
-                knope_scale,
-                parallel_context.gather_full_o_proj,
-            )
+                kv_outputs = self.exec_kv(
+                    kv_no_split,
+                    cos,
+                    sin,
+                    kv_cache,
+                    parallel_context.kv_slot_mapping,
+                    attn_metadata,
+                )
+                k_pe, k_nope = kv_outputs[:2]
+                knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
+                # k_li no longer exists at this point: it is computed by
+                # indexer.forward_k below and gathered at cache-write time, so
+                # the fused gather below only carries the main KV.
+                fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
+                    k_pe,
+                    k_nope,
+                    knope_scale,
+                    parallel_context.gather_full_o_proj,
+                )
 
-            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-            if self.qk_rope_head_dim:
-                q_pe = self.rope_single(q_pe, cos, sin)
-            self._record_query_gather_context(
-                ql_nope,
-                q_pe,
-                attn_metadata,
-            )
+                ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+                if self.qk_rope_head_dim:
+                    q_pe = self.rope_single(q_pe, cos, sin)
+                self._record_query_gather_context(
+                    ql_nope,
+                    q_pe,
+                    attn_metadata,
+                )
 
-            (
-                k_pe,
-                k_nope,
-            ) = self._store_parallel_kv(
-                k_pe,
-                k_nope,
-                knope_scale,
-                fused_kv_no_split,
-                kv_ag_handles,
-                kv_cache,
-                self._get_sfa_kv_slot_mapping(attn_metadata),
-                attn_metadata,
-                parallel_context.gather_full_o_proj,
-            )
+                (
+                    k_pe,
+                    k_nope,
+                ) = self._store_parallel_kv(
+                    k_pe,
+                    k_nope,
+                    knope_scale,
+                    fused_kv_no_split,
+                    kv_ag_handles,
+                    kv_cache,
+                    self._get_sfa_kv_slot_mapping(attn_metadata),
+                    attn_metadata,
+                    parallel_context.gather_full_o_proj,
+                )
 
-        # A sharded-decode PCP rank can own no request but must still write
-        # and gather KV with the other ranks.
-        has_local_query = attn_metadata.num_actual_tokens > 0
-        if self.runtime_has_indexer:
-            # One unified indexer call: k path -> cache write -> top-k
-            # selection (the selection kernel reads the freshly written
-            # cache). MTP skip_topk layers still run the k path and the write
-            # (compute_topk=False) so their cache stays up to date, then
-            # reuse the shared top-k indices. Cache layout, RoPE, parallel
-            # sequence lengths, and decode count all come from the indexer's
-            # independently built metadata.
-            assert k_hidden_states is not None
-            assert indexer_attn_metadata is not None
-            self._prepare_indexer_metadata(indexer_attn_metadata, attn_metadata)
-            topk_indices = self.indexer(
-                hidden_states,
-                q_c,
-                k_hidden_states,
-                indexer_attn_metadata,
-                compute_topk=not self.skip_topk and has_local_query,
-                attn_q_gather_handle=self._get_indexer_attn_q_gather_handle(attn_metadata),
-            )
-            if self.skip_topk:
+            # A sharded-decode PCP rank can own no request but must still write
+            # and gather KV with the other ranks.
+            has_local_query = attn_metadata.num_actual_tokens > 0
+        with record_activation_substage("attn_indexer", f"{layer_name}.attn.indexer"):
+            if self.runtime_has_indexer:
+                # One unified indexer call: k path -> cache write -> top-k
+                # selection (the selection kernel reads the freshly written
+                # cache). MTP skip_topk layers still run the k path and the write
+                # (compute_topk=False) so their cache stays up to date, then
+                # reuse the shared top-k indices. Cache layout, RoPE, parallel
+                # sequence lengths, and decode count all come from the indexer's
+                # independently built metadata.
+                assert k_hidden_states is not None
+                assert indexer_attn_metadata is not None
+                self._prepare_indexer_metadata(indexer_attn_metadata, attn_metadata)
+                topk_indices = self.indexer(
+                    hidden_states,
+                    q_c,
+                    k_hidden_states,
+                    indexer_attn_metadata,
+                    compute_topk=not self.skip_topk and has_local_query,
+                    attn_q_gather_handle=self._get_indexer_attn_q_gather_handle(attn_metadata),
+                )
+                if self.skip_topk:
+                    topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
+                elif self.use_index_cache and has_local_query:
+                    self._update_indexcache_topk_indices(topk_indices)
+            elif self.skip_topk:
+                # Static shared-index layers keep no runtime indexer cache and
+                # only reuse the shared top-k indices.
                 topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
-            elif self.use_index_cache and has_local_query:
-                self._update_indexcache_topk_indices(topk_indices)
-        elif self.skip_topk:
-            # Static shared-index layers keep no runtime indexer cache and
-            # only reuse the shared top-k indices.
-            topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
-        else:
-            raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
+            else:
+                raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
 
         # Notify for every layer that wrote the cache, not just indexer layers:
         # by this point all of the layer's KV (main + indexer) has been
@@ -2109,7 +2112,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Open the prefetch gate for every SFA layer. Some GLM-5.2 layers
         # reuse cached top-k indices and have no indexer, so recording this
         # inside the indexer's forward would leave their gate closed.
-        with attention_transfer_window():
+        with attention_transfer_window(), record_activation_substage("attn_sfa", f"{layer_name}.attn.sfa"):
             if has_local_query:
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope,
@@ -2121,19 +2124,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_key,
                 )
 
-        if has_local_query:
-            attn_output = self._v_up_proj(attn_output)
-        else:
-            # The O-proj below still joins its PCP/TP collectives.
-            attn_output = hidden_states.new_zeros((ql_nope.shape[0], self.local_num_heads * self.v_head_dim))
-        if gate_hidden_states is not None:
-            assert self.g_proj is not None
-            attn_output.mul_(torch.sigmoid(self.g_proj(gate_hidden_states.contiguous())[0]))
-        self._finalize_o_proj(
-            attn_output,
-            output[:num_input_tokens],
-            parallel_context.gather_full_o_proj,
-        )
+        with record_activation_substage("attn_o_proj", f"{layer_name}.attn.o_proj"):
+            if has_local_query:
+                attn_output = self._v_up_proj(attn_output)
+            else:
+                # The O-proj below still joins its PCP/TP collectives.
+                attn_output = hidden_states.new_zeros((ql_nope.shape[0], self.local_num_heads * self.v_head_dim))
+            if gate_hidden_states is not None:
+                assert self.g_proj is not None
+                attn_output.mul_(torch.sigmoid(self.g_proj(gate_hidden_states.contiguous())[0]))
+            self._finalize_o_proj(
+                attn_output,
+                output[:num_input_tokens],
+                parallel_context.gather_full_o_proj,
+            )
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
