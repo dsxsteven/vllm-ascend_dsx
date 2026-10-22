@@ -16,6 +16,7 @@ from vllm_ascend.activation_memory import (
     is_activation_peak_profiling,
     log_ffn_chunk_decision,
     log_mtp_moe_chunk_detail,
+    log_serving_peak_request_topk,
     profile_activation,
     profile_runner_phase,
     record_activation_buffer,
@@ -641,3 +642,79 @@ def test_equal_sampling_baseline_preserves_known_forward_peak_location():
     assert record.category == "target_moe_combine"
     assert record.baseline_bytes == 100
     assert record.peak_growth_bytes == 300
+
+
+def test_serving_peak_request_topk_ranks_by_absolute_peak():
+    """End-of-request top-K logs the largest absolute peaks in descending order."""
+    allocator = StatefulAllocator()
+
+    class Runner:
+        ascend_config = SimpleNamespace(
+            activation_peak_debug_serving=True,
+            activation_peak_debug_rank=0,
+            activation_peak_debug_max_steps=2,
+            serving_peak_request_topk=2,
+        )
+
+        @profile_runner_phase("forward")
+        def execute_model(self, scheduler_output, dummy_run=False, is_profile=False):
+            with record_activation_substage("attn_sfa", layer_idx=1):
+                allocator.pulse(500)
+            with record_activation_substage("moe_combine", layer_idx=2):
+                allocator.pulse(800)
+
+        @profile_runner_phase("sampling")
+        def sample_tokens(self, grammar_output=None):
+            with record_activation_substage("head"):
+                allocator.pulse(300)
+
+        def _maybe_log_serving_peak_request_topk(self, scheduler_output):
+            topk = int(getattr(self.ascend_config, "serving_peak_request_topk", 0))
+            if topk <= 0:
+                return
+            finished = getattr(scheduler_output, "finished_req_ids", None)
+            if not finished:
+                return
+            run_result = getattr(self, "_activation_peak_run_result", None)
+            if run_result is None:
+                return
+            log_serving_peak_request_topk(
+                rank=0,
+                topk=topk,
+                finished_req_ids=finished,
+                run_result=run_result,
+            )
+
+    runner = Runner()
+    finished_ids = {"req-1"}
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.is_initialized", return_value=False),
+        patch("vllm_ascend.activation_memory.logger.warning") as log,
+    ):
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=64))
+        runner.sample_tokens()
+        runner._maybe_log_serving_peak_request_topk(SimpleNamespace(finished_req_ids=finished_ids))
+
+    # Find the REQ_TOPK_ENTRY lines in emission order; peaks must be descending.
+    entries = [
+        args[0]
+        for (args, _kwargs) in log.call_args_list
+        if args and "[SERVING_MEMORY][REQ_TOPK_ENTRY]" in str(args[0])
+    ]
+    assert len(entries) == 2
+    assert "MOE_COMBINE" in entries[0]
+    assert "ATTN_SFA" in entries[1]
+
+
+def test_serving_peak_request_topk_noop_when_disabled():
+    """topk<=0 or missing run_result is a silent no-op."""
+    with patch("vllm_ascend.activation_memory.logger.warning") as log:
+        log_serving_peak_request_topk(
+            rank=0, topk=0, finished_req_ids={"req-1"}, run_result=None
+        )
+        log_serving_peak_request_topk(
+            rank=0, topk=5, finished_req_ids={"req-1"}, run_result=None
+        )
+    log.assert_not_called()
+
