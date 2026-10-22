@@ -28,10 +28,11 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
 from vllm.utils.torch_utils import direct_register_custom_op
-
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
+
+from vllm_ascend.activation_memory import profile_activation
 from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.ops.fused_moe.shared_experts import (
@@ -384,6 +385,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             shared_experts.wait_for_output()
         return fused_output
 
+    @profile_activation("moe_router_logits")
     def _compute_router_logits(
         self,
         hidden_states: torch.Tensor,

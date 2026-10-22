@@ -77,9 +77,6 @@ from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
-
-from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -108,6 +105,14 @@ from vllm_ascend.worker.v2.pp_transport import (
 from vllm_ascend.worker.v2.pp_transport import (
     make_empty_intermediate_tensors as make_pp_empty_intermediate_tensors,
 )
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    profile_activation,
+    record_activation_peak,
+    record_activation_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 
 sequence_parallel_chunk = sp_shard
 
@@ -398,23 +403,19 @@ class DeepseekV4MoE(nn.Module):
         if hidden_states_fp32 is not None:
             hidden_states_fp32 = hidden_states_fp32.view(-1, hidden_dim)
 
-        mtp_peak_active = (
-            self.activation_peak_debug
-            and self.activation_peak_phase == "mtp"
-            and is_activation_peak_profiling()
-        )
+        moe_peak_active = self.activation_peak_debug and is_activation_peak_profiling()
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoEFactory class
             router_input = hidden_states if hidden_states_fp32 is None else hidden_states_fp32
             experts_context = (
                 record_activation_peak(
-                    "mtp_moe_experts",
-                    f"mtp.layer.{self.layer_idx}.moe.experts_with_internal_router",
+                    f"{self.activation_peak_phase}_moe_experts",
+                    f"{self.activation_peak_phase}.layer.{self.layer_idx}.moe.experts_with_internal_router",
                     layer_idx=self.layer_idx,
                     num_tokens=hidden_states.shape[0],
                 )
-                if mtp_peak_active
+                if moe_peak_active
                 else nullcontext()
             )
             with experts_context:
@@ -428,12 +429,12 @@ class DeepseekV4MoE(nn.Module):
             router_input = hidden_states.float() if hidden_states_fp32 is None else hidden_states_fp32
             router_context = (
                 record_activation_peak(
-                    "mtp_moe_router_logits",
-                    f"mtp.layer.{self.layer_idx}.moe.router_logits",
+                    f"{self.activation_peak_phase}_moe_router_logits",
+                    f"{self.activation_peak_phase}.layer.{self.layer_idx}.moe.router_logits",
                     layer_idx=self.layer_idx,
                     num_tokens=hidden_states.shape[0],
                 )
-                if mtp_peak_active
+                if moe_peak_active
                 else nullcontext()
             )
             with router_context:
@@ -441,12 +442,12 @@ class DeepseekV4MoE(nn.Module):
 
             experts_context = (
                 record_activation_peak(
-                    "mtp_moe_experts",
-                    f"mtp.layer.{self.layer_idx}.moe.experts",
+                    f"{self.activation_peak_phase}_moe_experts",
+                    f"{self.activation_peak_phase}.layer.{self.layer_idx}.moe.experts",
                     layer_idx=self.layer_idx,
                     num_tokens=hidden_states.shape[0],
                 )
-                if mtp_peak_active
+                if moe_peak_active
                 else nullcontext()
             )
             with experts_context:
@@ -822,20 +823,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             attention_peak_context = nullcontext()
 
         with attention_peak_context:
-            residual = hidden_states.clone()
-            full_num_tokens = positions.shape[0]
-            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-            hidden_states = self.input_layernorm(hidden_states)
+            with record_activation_substage("attn_hc_pre"):
+                residual = hidden_states.clone()
+                full_num_tokens = positions.shape[0]
+                hidden_states, post, comb = self.hc_pre(
+                    hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                )
+                hidden_states = self.input_layernorm(hidden_states)
 
-            if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
-                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            with record_activation_substage("attn_sp_gather"):
+                if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
+                    hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
             attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
             hidden_states = self.self_attn(**attn_kwargs)
 
-            if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
-                hidden_states = sp_reduce_scatter(hidden_states)
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            with record_activation_substage("attn_hc_post"):
+                if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
+                    hidden_states = sp_reduce_scatter(hidden_states)
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         moe_peak_context = (
             record_activation_peak(
@@ -850,12 +856,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         with moe_peak_context:
             ffn_hc_pre_context = (
                 record_activation_peak(
-                    "mtp_ffn_hc_pre",
-                    f"mtp.layer.{self.layer_idx}.ffn.hc_pre",
+                    f"{phase}_ffn_hc_pre",
+                    f"{phase}.layer.{self.layer_idx}.ffn.hc_pre",
                     layer_idx=self.layer_idx,
                     num_tokens=num_tokens,
                 )
-                if activation_peak_active and phase == "mtp"
+                if activation_peak_active
                 else nullcontext()
             )
             with ffn_hc_pre_context:
@@ -870,12 +876,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             moe_core_context = (
                 record_activation_peak(
-                    "mtp_moe_core",
-                    f"mtp.layer.{self.layer_idx}.moe.core",
+                    f"{phase}_moe_core",
+                    f"{phase}.layer.{self.layer_idx}.moe.core",
                     layer_idx=self.layer_idx,
                     num_tokens=num_tokens,
                 )
-                if activation_peak_active and phase == "mtp"
+                if activation_peak_active
                 else nullcontext()
             )
             with moe_core_context:
@@ -887,12 +893,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             ffn_hc_post_context = (
                 record_activation_peak(
-                    "mtp_ffn_hc_post",
-                    f"mtp.layer.{self.layer_idx}.ffn.hc_post",
+                    f"{phase}_ffn_hc_post",
+                    f"{phase}.layer.{self.layer_idx}.ffn.hc_post",
                     layer_idx=self.layer_idx,
                     num_tokens=num_tokens,
                 )
-                if activation_peak_active and phase == "mtp"
+                if activation_peak_active
                 else nullcontext()
             )
             with ffn_hc_post_context:
@@ -1054,24 +1060,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             # RMSNorm: fp32 reduction on small per-token vectors, then
             # rescale the bf16 tensor. The fp32 intermediates (chunk, 16384)
             # exist only within this expression — freed before the next line.
-            inv_norm = torch.rsqrt(
-                xc_flat.float().square().mean(-1, keepdim=True) + self.norm_eps
-            )
+            inv_norm = torch.rsqrt(xc_flat.float().square().mean(-1, keepdim=True) + self.norm_eps)
 
             # Linear with pre-cast bf16 weight — no per-call .to(), no
             # cross-stream copy, no dtype mismatch.
-            mixes = torch.nn.functional.linear(
-                xc_flat * inv_norm.to(dtype), self._hc_fn_cast
-            )
+            mixes = torch.nn.functional.linear(xc_flat * inv_norm.to(dtype), self._hc_fn_cast)
 
             # Sigmoid gating in fp32 (tiny (chunk, hc_mult) output).
             pre = torch.sigmoid(mixes.float() * hc_scale + hc_base) + self.hc_eps
 
             # Weighted sum: (chunk, hc_mult, 1) bf16 * (chunk, hc_mult, H) bf16
             # → sum(dim=1) with fp32 accumulation → writes bf16 into y.
-            y[start:end] = torch.sum(
-                pre.to(dtype).unsqueeze(-1) * xc_flat.view(xc_shape), dim=1
-            )
+            y[start:end] = torch.sum(pre.to(dtype).unsqueeze(-1) * xc_flat.view(xc_shape), dim=1)
         return y
 
     def forward(
@@ -1087,7 +1087,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 with record_activation_peak(
-                    "target_embedding", "target.embed_tokens",
+                    "target_embedding",
+                    "target.embed_tokens",
                     num_tokens=input_ids.shape[0],
                 ):
                     hidden_states = self.embed_input_ids(input_ids)
@@ -1101,15 +1102,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             PPTransportDataType.AUX_HIDDEN_STATES,
         )
 
-        if self.use_sequence_parallel_moe:
-            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                forward_context = get_forward_context()
-                forward_context.is_padding = sp_padding_mask(forward_context.is_padding, hidden_states)
-            hidden_states = sp_shard(hidden_states)
-            # Non-first PP ranks receive None input_ids (the embedding was
-            # done upstream); only shard on the rank that owns the tokens.
-            if input_ids is not None:
-                input_ids = sp_shard(input_ids)
+        with record_activation_substage("sp_shard"):
+            if self.use_sequence_parallel_moe:
+                if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                    forward_context = get_forward_context()
+                    forward_context.is_padding = sp_padding_mask(forward_context.is_padding, hidden_states)
+                hidden_states = sp_shard(hidden_states)
+                # Non-first PP ranks receive None input_ids (the embedding was
+                # done upstream); only shard on the rank that owns the tokens.
+                if input_ids is not None:
+                    input_ids = sp_shard(input_ids)
 
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = None
@@ -1125,14 +1127,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if pp_group.is_first_rank:
             with record_activation_peak(
-                "target_hc_expand", "target.hc_repeat_expand",
+                "target_hc_expand",
+                "target.hc_repeat_expand",
                 num_tokens=hidden_states.shape[0],
             ):
                 hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             with record_activation_peak(
-                "target_layer", f"target.layer_total.{layer.layer_idx}",
-                layer_idx=layer.layer_idx, num_tokens=hidden_states.shape[0],
+                "target_layer",
+                f"target.layer_total.{layer.layer_idx}",
+                layer_idx=layer.layer_idx,
+                num_tokens=hidden_states.shape[0],
             ):
                 hidden_states, residual = layer(
                     positions,
@@ -1166,40 +1171,44 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # Runs on the sharded stream when SP is on; the buffer needs the full
         # token set, so gather for the buffer only (transient, freed after).
-        if self._needs_mtp_hidden_states:
-            if self._mtp_hidden_buffer is None:
-                self._mtp_hidden_buffer = torch.empty(
-                    self._mtp_buffer_shape,
-                    dtype=self._mtp_buffer_dtype,
-                    device=self.device,
-                )
-            if self.use_sequence_parallel_moe:
-                h_full = sp_all_gather(hidden_states.flatten(1))[: positions.shape[0]]
-                self._mtp_hidden_buffer[: h_full.shape[0]].copy_(h_full)
-                del h_full
-            else:
-                num_tokens = hidden_states.shape[0]
-                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        with record_activation_substage("mtp_hidden_stash"):
+            if self._needs_mtp_hidden_states:
+                if self._mtp_hidden_buffer is None:
+                    self._mtp_hidden_buffer = torch.empty(
+                        self._mtp_buffer_shape,
+                        dtype=self._mtp_buffer_dtype,
+                        device=self.device,
+                    )
+                if self.use_sequence_parallel_moe:
+                    h_full = sp_all_gather(hidden_states.flatten(1))[: positions.shape[0]]
+                    self._mtp_hidden_buffer[: h_full.shape[0]].copy_(h_full)
+                    del h_full
+                else:
+                    num_tokens = hidden_states.shape[0]
+                    self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         # Run hc_head on the SHARDED input when SP is on (per-token
         # independent, so sharding is exact). The gather then moves only the
         # compressed (N, H) output instead of the 4x-larger pre-hc_head
         # (N, hc_mult*H) tensor: gather volume drops hc_mult-fold.
         with record_activation_peak(
-            "target_tail", "target.hc_head_and_norm",
+            "target_tail",
+            "target.hc_head",
             num_tokens=hidden_states.shape[0],
         ):
             hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
 
         if self.use_sequence_parallel_moe:
             with record_activation_peak(
-                "target_sp_gather", "target.tail_sp_all_gather",
+                "target_sp_gather",
+                "target.tail_sp_all_gather",
                 num_tokens=hidden_states.shape[0],
             ):
                 hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
 
         with record_activation_peak(
-            "target_tail_norm", "target.final_norm",
+            "target_tail_norm",
+            "target.final_norm",
             num_tokens=hidden_states.shape[0],
         ):
             hidden_states = self.norm(hidden_states)
@@ -1311,6 +1320,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         return hidden_states
 
+    @profile_activation("head")
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1318,6 +1328,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    @profile_activation("head_local")
     def compute_logits_local(
         self,
         hidden_states: torch.Tensor,

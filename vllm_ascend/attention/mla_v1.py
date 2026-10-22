@@ -1,5 +1,5 @@
-from copy import copy
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
@@ -26,10 +26,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
-
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import (
@@ -74,6 +71,13 @@ from vllm_ascend.utils import (
     weak_ref_tensors,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    log_activation_skip,
+    record_activation_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -2265,7 +2269,7 @@ class AscendMLAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
-            # Profiling run.
+            log_activation_skip("attention", "no_attention_metadata")
             return output.fill_(0)
 
         num_actual_tokens = self.get_num_actual_tokens(attn_metadata)
@@ -2303,8 +2307,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             and attn_metadata.num_decode_tokens > 0
         )
         qkv_ctx = (
-            record_activation_peak(
-                "target_attn_qkv_proj",
+            record_activation_substage(
+                "attn_qkv_proj",
                 f"{scope_label}.attn.qkv_proj",
                 num_tokens=num_actual_tokens,
             )
@@ -2330,8 +2334,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     layer_name, hidden_states, kv_cache, attn_metadata
                 )
         sfa_ctx = (
-            record_activation_peak(
-                "target_attn_sfa",
+            record_activation_substage(
+                "attn_sfa",
                 f"{scope_label}.attn.sfa",
                 num_tokens=num_actual_tokens,
             )
@@ -2364,8 +2368,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             o_proj_input.mul_(torch.sigmoid(gate))
         # O proj
         o_proj_ctx = (
-            record_activation_peak(
-                "target_attn_o_proj",
+            record_activation_substage(
+                "attn_o_proj",
                 f"{scope_label}.attn.o_proj",
                 num_tokens=num_actual_tokens,
             )

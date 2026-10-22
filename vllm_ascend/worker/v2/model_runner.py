@@ -48,16 +48,6 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-
-from vllm_ascend.activation_memory import (
-    ActivationPeakProfiler,
-    activation_peak_profile_session,
-    record_activation_buffer,
-    record_activation_peak,
-    serving_memory_log_step,
-    serving_peak_step_session,
-)
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
     get_mc2_tokens_capacity,
@@ -67,7 +57,6 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_tokens_capacity,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
@@ -129,6 +118,17 @@ from vllm_ascend.worker.v2.utils import (
     torch_cuda_wrapper,
 )
 
+from vllm_ascend.activation_memory import (
+    ActivationPeakProfiler,
+    activation_peak_profile_session,
+    profile_runner_phase,
+    record_activation_buffer,
+    record_activation_peak,
+    serving_memory_log_step,
+)
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.mla_v1 import AscendMLABackend
+
 
 class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
@@ -146,20 +146,8 @@ class NPUModelRunner(GPUModelRunner):
         self.ascend_config = get_ascend_config()
         # Serving-path memory logging reuses the activation_peak_debug flag,
         # cached once to avoid re-reading config per execute_model step.
-        self.activation_peak_debug = bool(
-            getattr(self.ascend_config, "activation_peak_debug", False)
-        )
-        self.activation_peak_debug_rank = int(
-            getattr(self.ascend_config, "activation_peak_debug_rank", 0)
-        )
-        # Per-step scoped serving-peak mode (heavier; replaces the lightweight
-        # STEP log when on). Cached once to avoid re-reading config per step.
-        self.serving_peak_debug = bool(
-            getattr(self.ascend_config, "serving_peak_debug", False)
-        )
-        self.serving_peak_debug_rank = int(
-            getattr(self.ascend_config, "serving_peak_debug_rank", 0)
-        )
+        self.activation_peak_debug = bool(getattr(self.ascend_config, "activation_peak_debug", False))
+        self.activation_peak_debug_rank = int(getattr(self.ascend_config, "activation_peak_debug_rank", 0))
         self.sparse_kv_offload_manager = None
         self.kvpp = KVPPRuntime()
         # Adaptive verification uses this flag to apply FIA-specific query
@@ -331,6 +319,7 @@ class NPUModelRunner(GPUModelRunner):
             pcp_manager._sampling_hidden_restored = True
         self.execute_model_state = state
 
+    @profile_runner_phase("sampling")
     def sample_tokens(self, grammar_output):
         if (
             lmhead_tp_enable()
@@ -506,6 +495,7 @@ class NPUModelRunner(GPUModelRunner):
             layer.impl.bind_copy_sfa_kv_cache(manager, layer_name)
 
     @torch.inference_mode()
+    @profile_runner_phase("forward")
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -553,45 +543,22 @@ class NPUModelRunner(GPUModelRunner):
                     else nullcontext()
                 )
                 with target_scope:
-                    # Per-step scoped serving-peak mode (serving_peak_debug) is
-                    # mutually exclusive with the lightweight STEP log: the
-                    # per-step peak reset clobbers the cumulative run_peak the
-                    # STEP log reports. Only one of the two runs for a real
-                    # serving step (never for dummy/profile).
-                    serving_peak_rank = (
-                        self._serving_peak_rank()
-                        if not dummy_run and not is_profile
-                        else None
-                    )
-                    serving_mem_rank = (
-                        self._serving_memory_rank()
-                        if not dummy_run and not is_profile and serving_peak_rank is None
-                        else None
-                    )
-                    peak_scope = (
-                        serving_peak_step_session(
-                            rank=serving_peak_rank,
-                            num_tokens=scheduler_output.total_num_scheduled_tokens,
-                        )
-                        if serving_peak_rank is not None
-                        else nullcontext()
-                    )
+                    serving_mem_rank = self._serving_memory_rank() if not dummy_run and not is_profile else None
                     if serving_mem_rank is not None:
                         serving_memory_log_step(
                             rank=serving_mem_rank,
                             phase="pre_forward",
                             num_tokens=scheduler_output.total_num_scheduled_tokens,
                         )
-                    with peak_scope:
-                        output = super().execute_model(
-                            scheduler_output,
-                            intermediate_tensors=intermediate_tensors,
-                            dummy_run=dummy_run,
-                            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                            is_profile=is_profile,
-                            context_len=context_len,
-                            valid_dummy_state_slots=valid_dummy_state_slots,
-                        )
+                    output = super().execute_model(
+                        scheduler_output,
+                        intermediate_tensors=intermediate_tensors,
+                        dummy_run=dummy_run,
+                        skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                        is_profile=is_profile,
+                        context_len=context_len,
+                        valid_dummy_state_slots=valid_dummy_state_slots,
+                    )
                     forward_failed = False
                     if serving_mem_rank is not None:
                         serving_memory_log_step(
@@ -675,29 +642,6 @@ class NPUModelRunner(GPUModelRunner):
             return global_rank
         return global_rank if global_rank == configured else None
 
-    def _serving_peak_rank(self) -> int | None:
-        """Return the global rank if per-step scoped serving-peak logging is on.
-
-        Gated by ``serving_peak_debug``; ``serving_peak_debug_rank`` selects
-        which ranks log (0 = rank 0, -1 = all ranks). Returns ``None`` when the
-        feature is off so callers skip the per-step scope entirely (zero
-        per-step cost). Mutually exclusive with the lightweight STEP log: when
-        this returns a rank, callers should NOT also call
-        ``serving_memory_log_step`` (the per-step peak reset clobbers the
-        cumulative ``run_peak`` the STEP log reports).
-        """
-        if not getattr(self, "serving_peak_debug", False):
-            return None
-        configured = int(getattr(self, "serving_peak_debug_rank", 0))
-        global_rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else 0
-        )
-        if configured == -1:
-            return global_rank
-        return global_rank if global_rank == configured else None
-
     @torch.inference_mode()
     def profile_run(self) -> None:
         """Override GPUModelRunner.profile_run for Ascend NPUs.
@@ -762,7 +706,8 @@ class NPUModelRunner(GPUModelRunner):
                     and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
                     in {MoECommType.MC2, MoECommType.FUSED_MC2}
                 ):
-                    # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
+                    # Use a call-scoped bypass; skip_compiled would require
+                    # runner-specific ForwardContext plumbing.
                     with disable_compilation(self.get_model()):
                         self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
                 super().profile_run()

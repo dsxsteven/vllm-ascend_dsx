@@ -23,18 +23,9 @@ import torch
 from vllm.distributed import get_dp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
-
-from vllm_ascend.activation_memory import (
-    is_activation_peak_profiling,
-    log_ffn_chunk_decision,
-    log_mtp_moe_chunk_detail,
-    record_mtp_moe_substage,
-)
-from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.ops.fused_moe import moe_utils
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
     MoEFusedExpertsInput,
     MoEWeights,
@@ -48,7 +39,6 @@ from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
 )
-from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
@@ -62,6 +52,17 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    log_ffn_chunk_decision,
+    log_mtp_moe_chunk_detail,
+    profile_activation,
+    record_moe_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
+from vllm_ascend.ops.fused_moe import moe_utils
+from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 
 _MoECommMethods: dict[tuple[MoECommType | None, tuple[int, ...]], MoECommMethod] = {}
 
@@ -260,7 +261,7 @@ class MoECommMethod(ABC):
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
 
-        with record_mtp_moe_substage(
+        with record_moe_substage(
             "dispatch",
             "moe.dispatch",
             num_tokens=fused_experts_input.hidden_states.shape[0],
@@ -286,7 +287,7 @@ class MoECommMethod(ABC):
                 supported=chunking_supported,
             )
 
-        with record_mtp_moe_substage(
+        with record_moe_substage(
             "expert_ffn",
             "moe.expert_ffn",
             num_tokens=mlp_compute_input.hidden_states.shape[0],
@@ -297,7 +298,7 @@ class MoECommMethod(ABC):
                 mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
 
         before_combine_evt = torch.npu.current_stream().record_event()
-        with record_mtp_moe_substage(
+        with record_moe_substage(
             "combine",
             "moe.combine",
             num_tokens=mlp_output.shape[0],
@@ -500,7 +501,7 @@ class AlltoAllCommImpl(MoECommMethod):
         before_combine_evt = None
 
         for chunk_idx, (start, end) in enumerate(ranges):
-            with record_mtp_moe_substage(
+            with record_moe_substage(
                 "chunk",
                 f"moe.chunk.{chunk_idx + 1}_of_{num_chunks}",
                 num_tokens=end - start,
@@ -509,7 +510,7 @@ class AlltoAllCommImpl(MoECommMethod):
                 # NOTE: unlike 0.23.0, the log2phy remap already happened
                 # upstream in AscendMoERunner.apply_routed_experts, so
                 # chunk_input.topk_ids is already physical expert ids.
-                with record_mtp_moe_substage(
+                with record_moe_substage(
                     "dispatch",
                     f"moe.chunk.{chunk_idx + 1}.dispatch",
                     num_tokens=end - start,
@@ -537,14 +538,14 @@ class AlltoAllCommImpl(MoECommMethod):
                     token_dispatch_output=token_dispatch_output,
                     moe_config=self.moe_config,
                 )
-                with record_mtp_moe_substage(
+                with record_moe_substage(
                     "expert_ffn",
                     f"moe.chunk.{chunk_idx + 1}.expert_ffn",
                     num_tokens=mlp_compute_input.hidden_states.shape[0],
                 ):
                     mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
                 before_combine_evt = torch.npu.current_stream().record_event()
-                with record_mtp_moe_substage(
+                with record_moe_substage(
                     "combine",
                     f"moe.chunk.{chunk_idx + 1}.combine",
                     num_tokens=mlp_output.shape[0],
@@ -850,7 +851,6 @@ class FusedMC2CommImpl(MoECommMethod):
         # return value, so there is nothing to keep on the instance.
         return out, expert_tokens
 
-
     def _fused_mc2_chunk_count(self, num_tokens: int) -> int:
         """Return a collective-safe chunk count for dispatch_ffn_combine."""
         if not self.enable_ffn_chunking or get_ascend_config().enable_fused_mc2 != 1:
@@ -880,16 +880,13 @@ class FusedMC2CommImpl(MoECommMethod):
             max_source_tokens_per_rank = (
                 self.token_dispatcher.global_bs + self.token_dispatcher.ep_world_size - 1
             ) // self.token_dispatcher.ep_world_size
-            max_source_tokens_per_chunk = (
-                max_source_tokens_per_rank + num_chunks - 1
-            ) // num_chunks
+            max_source_tokens_per_chunk = (max_source_tokens_per_rank + num_chunks - 1) // num_chunks
         worst_case_routed_tokens = (
-            max_source_tokens_per_chunk
-            * self.token_dispatcher.ep_world_size
-            * self.moe_config.experts_per_token
+            max_source_tokens_per_chunk * self.token_dispatcher.ep_world_size * self.moe_config.experts_per_token
         )
         return min(get_ascend_config().mega_moe_max_tokens, worst_case_routed_tokens)
 
+    @profile_activation("moe_fused_dispatch_ffn_combine")
     def _apply_dispatch_ffn_combine(
         self,
         fused_experts_input: MoEFusedExpertsInput,

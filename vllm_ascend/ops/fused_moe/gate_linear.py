@@ -20,8 +20,9 @@ from __future__ import annotations
 import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
-
 from vllm_ascend.ops.linear import AscendReplicatedLinear
+
+from vllm_ascend.activation_memory import profile_activation
 
 
 class AscendGateLinear(GateLinear):
@@ -52,6 +53,7 @@ class AscendGateLinear(GateLinear):
         )
         self.out_dtype = out_dtype
 
+    @profile_activation("moe_router")
     def forward(self, x: torch.Tensor):
         # TODO: Remove this workaround after upgrading to a vLLM version that
         # no longer forces router logits to bf16 via
