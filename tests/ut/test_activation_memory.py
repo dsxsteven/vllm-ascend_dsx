@@ -1,18 +1,29 @@
+# ruff: noqa: SIM117
+# Explicit nesting exercises parent/child scope ownership.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+import torch
+
 from vllm_ascend.activation_memory import (
     activation_peak_profile_session,
+    is_activation_peak_profiling,
     log_ffn_chunk_decision,
     log_mtp_moe_chunk_detail,
+    profile_activation,
+    profile_runner_phase,
     record_activation_buffer,
     record_activation_peak,
+    record_activation_substage,
+    record_moe_substage,
     record_mtp_moe_substage,
     serving_memory_log_step,
-    serving_peak_step_session,
 )
 
 
@@ -58,7 +69,7 @@ def test_nested_activation_peak_scopes_preserve_overall_peak():
     assert target.peak_bytes == 180
     assert target.peak_growth_bytes == 80
     assert target.retained_bytes == 5
-    assert fake_npu.reset_peak_memory_stats.call_count == 3
+    assert fake_npu.reset_peak_memory_stats.call_count == 5
     # The pinning record is the most-specific scope whose in-scope peak reaches
     # the overall peak. The inner attention scope closed first at peak 170, then
     # the outer target scope closed at peak 180 — so the outer record wins.
@@ -121,32 +132,19 @@ def test_global_peak_location_locates_pinning_scope():
     assert profiler is not None
     assert profiler.overall_peak_bytes == 200
     assert profiler.overall_peak_record is not None
-    # overall_peak_record uses a last-wins tie rule on scope exit, so the outer
-    # model scope (which closes last at the overall peak) wins the attribute.
-    assert profiler.overall_peak_record.category == "target_model"
+    # Equal inherited peaks must never erase the leaf that caused the peak.
+    assert profiler.overall_peak_record.category == "target_moe"
     assert profiler.overall_peak_record.peak_bytes == 200
 
-    global_peak_log = next(
-        call for call in mock_warning.call_args_list if "[GLOBAL_PEAK]" in call.args[0]
-    )
-    # rank, absolute_peak GiB, category, label, layer, tokens, growth MiB, baseline GiB
-    assert global_peak_log.args[0] == (
-        "[ACTIVATION_PEAK][GLOBAL_PEAK] rank=%s absolute_peak=%.3f GiB "
-        "category=%s label=%s layer=%s tokens=%s growth=%.3f MiB "
-        "baseline=%.3f GiB"
-    )
-    assert global_peak_log.args[1] == 1
-    # GLOBAL_PEAK reports the most-specific pinning location: the inner moe
-    # scope reaches the overall peak first (inner scopes close before parents),
-    # so it is the most specific scope that pins the peak.
-    assert global_peak_log.args[3] == "TARGET_MOE"
-
-    # Per-category absolute-peak location lines are emitted for both categories.
-    abs_peak_categories = {
-        call.args[2] for call in mock_warning.call_args_list if "[ABS_PEAK]" in call.args[0]
-    }
-    assert "TARGET_MODEL" in abs_peak_categories
-    assert "TARGET_MOE" in abs_peak_categories
+    global_peak_log = next(call for call in mock_warning.call_args_list if "[GLOBAL_PEAK]" in call.args[0])
+    line = global_peak_log.args[0] % global_peak_log.args[1:]
+    assert "rank=1" in line
+    assert "category=TARGET_MOE" in line
+    assert "layer=3" in line
+    assert "peak_bytes=200" in line
+    abs_lines = [c.args[0] % c.args[1:] for c in mock_warning.call_args_list if "[ABS_PEAK]" in c.args[0]]
+    assert any("category=TARGET_MODEL" in line for line in abs_lines)
+    assert any("category=TARGET_MOE" in line for line in abs_lines)
 
 
 def test_ffn_chunk_decision_uses_current_moe_scope():
@@ -283,97 +281,363 @@ def test_serving_memory_log_step_does_not_sync_or_reset_peak():
     # format string carries the documented fields
     assert pre.args[0] == (
         "[SERVING_MEMORY][STEP] rank=%s phase=%s step=%s tokens=%s "
-        "allocated=%.3f GiB run_peak=%.3f GiB"
+        "allocated=%.3f GiB allocator_peak_since_reset=%.3f GiB"
     )
 
 
-def test_serving_peak_step_session_logs_absolute_peak_and_components():
-    # One serving forward: target_model wraps target_attn_sfa and target_moe.
-    # The moe scope reaches the absolute peak (the most-specific pinning
-    # location). The STEP_PEAK header carries absolute_peak + at=TARGET_MOE,
-    # and a STEP_PEAK_COMP line is emitted per present component.
-    #
-    # max_memory_allocated side effects (one per checkpoint):
-    #   session open:100
-    #   target entry ckpt:100
-    #   sfa entry ckpt:100
-    #   sfa exit ckpt:120
-    #   moe entry ckpt:120
-    #   moe exit ckpt:200        <- absolute peak, pinned by moe
-    #   target exit ckpt:200
-    #   session final ckpt:200
-    fake_npu = SimpleNamespace(
-        synchronize=MagicMock(),
-        reset_peak_memory_stats=MagicMock(),
-        max_memory_allocated=MagicMock(
-            side_effect=[100, 100, 100, 120, 120, 200, 200, 200]
-        ),
-        # target baseline:100; sfa baseline:100; sfa exit after:110;
-        # moe baseline:120; moe exit after:160; target exit after:170.
-        memory_allocated=MagicMock(side_effect=[100, 100, 110, 120, 160, 170]),
-    )
+class StatefulAllocator:
+    """Model real allocator reset semantics, unlike a predetermined value list."""
 
+    def __init__(self):
+        self.current = 100
+        self.peak = 100
+
+    def synchronize(self):
+        pass
+
+    def memory_allocated(self):
+        return self.current
+
+    def max_memory_allocated(self):
+        return self.peak
+
+    def reset_peak_memory_stats(self):
+        self.peak = self.current
+
+    def pulse(self, peak, retained=100):
+        self.peak = max(self.peak, peak)
+        self.current = retained
+
+
+def test_unscoped_larger_peak_has_unknown_location():
+    allocator = StatefulAllocator()
     with (
-        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
-        patch("vllm_ascend.activation_memory.logger.warning") as mock_warning,
-        serving_peak_step_session(rank=0, num_tokens=27000),
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as log,
     ):
-        with record_activation_peak("target_model", "target.model_forward", num_tokens=27000):
-            with record_activation_peak(
-                "target_attn_sfa",
-                "target.layer.5.attn_sfa",
-                layer_idx=5,
-                num_tokens=27000,
-            ):
-                pass
-            with record_activation_peak(
-                "target_moe",
-                "target.layer.5.moe",
-                layer_idx=5,
-                num_tokens=27000,
-            ):
-                pass
-
-    step_peak_logs = [call for call in mock_warning.call_args_list if "[STEP_PEAK]" in call.args[0]]
-    assert step_peak_logs, "expected a STEP_PEAK header line"
-    header = step_peak_logs[0]
-    # absolute_peak (GiB) is args[4]; at= is args[5]
-    assert header.args[4] == 200 / (1024**3)
-    assert header.args[5] == "MOE"
-
-    comp_logs = {
-        call.args[3]: call
-        for call in mock_warning.call_args_list
-        if "[STEP_PEAK_COMP]" in call.args[0]
-    }
-    assert "ATTN_SFA" in comp_logs
-    assert "MOE" in comp_logs
-    # moe component peak equals the absolute peak; sfa peak is its own 120.
-    assert comp_logs["MOE"].args[4] == 200 / (1024**3)
-    assert comp_logs["ATTN_SFA"].args[4] == 120 / (1024**3)
-    # growth fields are populated (MiB).
-    assert comp_logs["MOE"].args[5] == (200 - 120) / (1024**2)
-    assert comp_logs["ATTN_SFA"].args[5] == (120 - 100) / (1024**2)
+        with activation_peak_profile_session(enabled=True, rank=0) as profiler:
+            with record_activation_peak("target_moe", "layer.3.moe", layer_idx=3):
+                allocator.pulse(200)
+            allocator.pulse(300)
+    assert profiler.overall_peak_bytes == 300
+    assert profiler.overall_peak_record is None
+    line = next(c.args[0] % c.args[1:] for c in log.call_args_list if "[GLOBAL_PEAK]" in c.args[0])
+    assert "category=UNKNOWN" in line
+    assert "growth_bytes=None" in line
 
 
-def test_serving_peak_step_session_restores_contextvar():
-    # After the session exits, no profiler should be active (a subsequent
-    # record_activation_peak must be a no-op that does not touch the allocator).
-    fake_npu = SimpleNamespace(
-        synchronize=MagicMock(),
-        reset_peak_memory_stats=MagicMock(),
-        max_memory_allocated=MagicMock(side_effect=[100, 100, 100]),
-        memory_allocated=MagicMock(side_effect=[100]),
-    )
+def test_absolute_peak_and_growth_are_selected_from_the_same_instance():
+    allocator = StatefulAllocator()
     with (
-        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as log,
+    ):
+        with activation_peak_profile_session(enabled=True, rank=0):
+            with record_activation_peak("target_moe", "layer.1", layer_idx=1):
+                allocator.pulse(200, retained=190)  # growth 100
+            with record_activation_peak("target_moe", "layer.2", layer_idx=2):
+                allocator.pulse(220, retained=190)  # largest absolute, growth 30
+    line = next(c.args[0] % c.args[1:] for c in log.call_args_list if "[ABS_PEAK]" in c.args[0])
+    assert "peak_bytes=220" in line
+    assert "baseline_bytes=190" in line
+    assert "growth_bytes=30" in line
+    assert "layer=2" in line
+
+
+def test_target_and_mtp_substages_inherit_layer_identity():
+    allocator = StatefulAllocator()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
         patch("vllm_ascend.activation_memory.logger.warning"),
-        serving_peak_step_session(rank=0, num_tokens=10),
     ):
-        pass
-    # reset_peak_memory_stats is called once at session entry; a lingering
-    # profiler would cause record_activation_peak to call it again.
-    before = fake_npu.reset_peak_memory_stats.call_count
-    with record_activation_peak("target_model", "target.model_forward"):
-        pass
-    assert fake_npu.reset_peak_memory_stats.call_count == before
+        with activation_peak_profile_session(enabled=True, rank=0) as profiler:
+            for phase in ("target", "mtp"):
+                with record_activation_peak(f"{phase}_attention", "parent", layer_idx=7):
+                    with record_activation_substage("attn_q_proj"):
+                        allocator.pulse(200)
+                with record_activation_peak(f"{phase}_moe", "parent", layer_idx=7):
+                    with record_moe_substage("dispatch", "moe.dispatch"):
+                        allocator.pulse(250)
+    categories = {r.category for r in profiler.records}
+    assert {"target_attn_q_proj", "mtp_attn_q_proj", "target_moe_dispatch", "mtp_moe_dispatch"} <= categories
+    assert all(r.layer_idx == 7 for r in profiler.records)
+    assert any(r.label == "mtp.layer.7.attn_q_proj" for r in profiler.records)
+
+
+def test_serving_profiles_merge_forward_and_sampling_and_keep_run_peak():
+    allocator = StatefulAllocator()
+
+    class Runner:
+        ascend_config = SimpleNamespace(
+            activation_peak_debug_serving=True, activation_peak_debug_rank=0, activation_peak_debug_max_steps=2
+        )
+
+        @profile_runner_phase("forward")
+        def execute_model(self, scheduler_output, dummy_run=False, is_profile=False):
+            with record_activation_peak("target_moe", "moe", layer_idx=1):
+                allocator.pulse(400 if scheduler_output.high else 250)
+
+        @profile_runner_phase("sampling")
+        def sample_tokens(self, grammar_output=None):
+            with record_activation_substage("head"):
+                allocator.pulse(300)
+
+    runner = Runner()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.is_initialized", return_value=False),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+    ):
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=64, high=True))
+        runner.sample_tokens()
+        assert runner._activation_peak_step_records.phase == "full_step"
+        assert runner._activation_peak_step_records.overall_peak_bytes == 400
+        assert runner._activation_peak_step_records.overall_peak_record.category == "target_moe"
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=64, high=False))
+        runner.sample_tokens()
+        assert runner._activation_peak_step_records.overall_peak_bytes == 300
+        assert runner._activation_peak_run_result.overall_peak_bytes == 400
+        assert not is_activation_peak_profiling()
+
+
+def test_profile_context_is_cleared_after_checkpoint_failure():
+    allocator = StatefulAllocator()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+    ):
+        try:
+            with activation_peak_profile_session(enabled=True, rank=0):
+                allocator.synchronize = MagicMock(side_effect=RuntimeError("device error"))
+        except RuntimeError:
+            pass
+    assert not is_activation_peak_profiling()
+
+
+def test_original_forward_failure_is_not_masked_by_device_cleanup():
+    allocator = StatefulAllocator()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+        pytest.raises(ValueError, match="original operator error"),
+        activation_peak_profile_session(enabled=True, rank=0),
+        record_activation_peak("target_moe", "moe"),
+    ):
+        allocator.synchronize = MagicMock(side_effect=RuntimeError("secondary device error"))
+        raise ValueError("original operator error")
+    allocator.synchronize.assert_not_called()
+    assert not is_activation_peak_profiling()
+
+
+def test_serving_step_limit_and_dummy_runs_do_not_collect_extra_steps():
+    allocator = StatefulAllocator()
+    observed = []
+
+    class Runner:
+        ascend_config = SimpleNamespace(
+            activation_peak_debug_serving=True,
+            activation_peak_debug_rank=0,
+            activation_peak_debug_max_steps=1,
+        )
+
+        @profile_runner_phase("forward")
+        def execute_model(self, scheduler_output, dummy_run=False, is_profile=False):
+            observed.append(is_activation_peak_profiling())
+            if is_activation_peak_profiling():
+                with record_activation_substage("attn_sfa"):
+                    allocator.pulse(200)
+
+    runner = Runner()
+    scheduler = SimpleNamespace(total_num_scheduled_tokens=64)
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.is_initialized", return_value=False),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+    ):
+        runner.execute_model(scheduler, dummy_run=True)
+        runner.execute_model(scheduler, is_profile=True)
+        runner.execute_model(scheduler)
+        runner.execute_model(scheduler)
+    assert observed == [False, False, True, False]
+    assert runner._activation_peak_step == 2
+    assert runner._activation_peak_run_result.overall_peak_bytes == 200
+
+
+def test_unselected_rank_never_reads_or_resets_allocator():
+    fake_npu = MagicMock()
+
+    class Runner:
+        ascend_config = SimpleNamespace(
+            activation_peak_debug_serving=True,
+            activation_peak_debug_rank=0,
+            activation_peak_debug_max_steps=0,
+        )
+
+        @profile_runner_phase("forward")
+        def execute_model(self, scheduler_output):
+            assert not is_activation_peak_profiling()
+            return "unchanged"
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.is_initialized", return_value=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.get_rank", return_value=1),
+    ):
+        assert Runner().execute_model(SimpleNamespace(total_num_scheduled_tokens=64)) == "unchanged"
+    assert not fake_npu.mock_calls
+
+
+def test_moe_chunk_labels_preserve_chunk_identity_and_draft_phase():
+    allocator = StatefulAllocator()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+        activation_peak_profile_session(enabled=True, rank=0) as profiler,
+        record_activation_peak("mtp_moe", "mtp.layer.7.moe", layer_idx=7),
+    ):
+        for index in (1, 2):
+            with record_moe_substage("dispatch", f"moe.chunk.{index}.dispatch", num_tokens=32):
+                allocator.pulse(200 + index)
+    labels = [record.label for record in profiler.records if record.category == "mtp_moe_dispatch"]
+    assert labels == ["mtp.layer.7.moe.chunk.1.dispatch", "mtp.layer.7.moe.chunk.2.dispatch"]
+
+
+def test_precast_internal_router_fast_path_is_measured():
+    source = Path(__file__).resolve().parents[2] / "vllm_ascend" / "ops" / "fused_moe" / "fused_moe.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_compute_router_logits")
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    allocator = StatefulAllocator()
+    result = torch.ones(2, 4)
+    linear = MagicMock(side_effect=lambda *args: (allocator.pulse(200), result)[1])
+    env = {"torch": torch, "F": SimpleNamespace(linear=linear), "profile_activation": profile_activation}
+    exec(compile(module, str(source), "exec"), env)
+    gate = MagicMock()
+    gate.weight_fp32 = torch.ones(4, 3)
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+        activation_peak_profile_session(enabled=True, rank=0) as profiler,
+        record_activation_peak("target_moe", "target.layer.4.moe", layer_idx=4),
+    ):
+        actual = env["_compute_router_logits"](SimpleNamespace(gate=gate), torch.ones(2, 3), torch.ones(2, 3))
+    assert actual is result
+    gate.assert_not_called()
+    linear.assert_called_once()
+    assert profiler.overall_peak_record.category == "target_moe_router_logits"
+    assert profiler.overall_peak_record.layer_idx == 4
+
+
+def test_legacy_serving_session_uses_fresh_peak_and_emits_matched_components():
+    from vllm_ascend.activation_memory import serving_peak_step_session
+
+    allocator = StatefulAllocator()
+    allocator.peak = 900  # A previous operation must not pin this serving step.
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as log,
+        serving_peak_step_session(rank=0, num_tokens=64) as profiler,
+    ):
+        with record_activation_peak("target_model", "target", num_tokens=64):
+            with record_activation_substage("attn_q_proj", layer_idx=2):
+                allocator.pulse(200)
+            with record_activation_substage("moe_combine", layer_idx=2):
+                allocator.pulse(300)
+    assert profiler.overall_peak_bytes == 300
+    assert profiler.most_specific_peak_record().category == "target_moe_combine"
+    logs = [call.args[0] % call.args[1:] for call in log.call_args_list]
+    assert any("[STEP_PEAK]" in line and "at=MOE_COMBINE" in line for line in logs)
+    assert any("[STEP_PEAK_COMP]" in line and "component=MOE_COMBINE" in line for line in logs)
+
+
+def test_legacy_serving_session_reuses_outer_session_and_clears_after_failure():
+    from vllm_ascend.activation_memory import serving_peak_step_session
+
+    allocator = StatefulAllocator()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+    ):
+        with activation_peak_profile_session(enabled=True, rank=0) as outer:
+            with serving_peak_step_session(rank=0, num_tokens=64) as inner:
+                assert inner is outer
+            assert is_activation_peak_profiling()
+        with pytest.raises(ValueError, match="operator"):
+            with serving_peak_step_session(rank=0, num_tokens=64):
+                raise ValueError("operator")
+        assert not is_activation_peak_profiling()
+
+
+def test_legacy_serving_flag_honors_rank_step_limit_and_sampling():
+    allocator = StatefulAllocator()
+    active = []
+
+    class Runner:
+        ascend_config = SimpleNamespace(
+            serving_peak_debug=True,
+            serving_peak_debug_rank=1,
+            activation_peak_debug_serving=False,
+            activation_peak_debug_rank=0,
+            activation_peak_debug_max_steps=1,
+        )
+
+        @profile_runner_phase("forward")
+        def execute_model(self, scheduler_output):
+            active.append(is_activation_peak_profiling())
+            with record_activation_substage("attn_sfa", layer_idx=4):
+                allocator.pulse(200)
+
+        @profile_runner_phase("sampling")
+        def sample_tokens(self):
+            active.append(is_activation_peak_profiling())
+            with record_activation_substage("head"):
+                allocator.pulse(300)
+
+    runner = Runner()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.is_initialized", return_value=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.get_rank", return_value=1),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+    ):
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=64))
+        runner.sample_tokens()
+        assert runner._activation_peak_step_records.phase == "full_step"
+        assert runner._activation_peak_step_records.overall_peak_bytes == 300
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=64))
+        runner.sample_tokens()
+    assert active == [True, True, False, False]
+
+
+def test_equal_sampling_baseline_preserves_known_forward_peak_location():
+    allocator = StatefulAllocator()
+
+    class Runner:
+        ascend_config = SimpleNamespace(
+            activation_peak_debug_serving=True,
+            activation_peak_debug_rank=0,
+            activation_peak_debug_max_steps=0,
+        )
+
+        @profile_runner_phase("forward")
+        def execute_model(self, scheduler_output):
+            with record_activation_substage("moe_combine", layer_idx=3):
+                allocator.pulse(400, retained=400)
+
+        @profile_runner_phase("sampling")
+        def sample_tokens(self):
+            pass
+
+    runner = Runner()
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
+        patch("vllm_ascend.activation_memory.torch.distributed.is_initialized", return_value=False),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+    ):
+        runner.execute_model(SimpleNamespace(total_num_scheduled_tokens=64))
+        runner.sample_tokens()
+    record = runner._activation_peak_step_records.overall_peak_record
+    assert record is not None
+    assert record.category == "target_moe_combine"
+    assert record.baseline_bytes == 100
+    assert record.peak_growth_bytes == 300

@@ -20,8 +20,9 @@ from __future__ import annotations
 import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
-
 from vllm_ascend.ops.linear import AscendReplicatedLinear
+
+from vllm_ascend.activation_memory import profile_activation
 
 
 class AscendGateLinear(GateLinear):
@@ -83,6 +84,7 @@ class AscendGateLinear(GateLinear):
         # docstring); out_dtype is immutable afterwards.
         self.out_dtype = out_dtype if out_dtype is not None else torch.float32
 
+    @profile_activation("moe_router")
     def forward(self, x: torch.Tensor):
         # Tier 4: bf16 x bf16 -> fp32 accumulation. Eligibility mirrors
         # upstream: bf16 weight (i.e. no fp32 upcast requested), fp32
