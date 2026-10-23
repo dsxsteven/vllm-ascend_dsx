@@ -786,14 +786,25 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # Pre-init contexts (unit tests) have no AscendConfig; chunking
             # is a deployment feature, treat it as disabled there.
             return None
+        chunk_size = int(ascend_config.attention_chunk_size)
         if not sfa_attention_chunking_eligible(
             enable_attention_chunking=ascend_config.enable_attention_chunking,
-            attention_chunk_size=int(ascend_config.attention_chunk_size),
+            attention_chunk_size=chunk_size,
             num_prefills=metadata.num_prefills,
             num_decode_tokens=metadata.num_decode_tokens,
             num_input_tokens=metadata.num_input_tokens,
             num_actual_tokens=metadata.num_actual_tokens,
         ):
+            if metadata.num_actual_tokens > chunk_size:
+                # Size-eligible step that still fell back — say why, once.
+                logger.info_once(
+                    "SFA attention chunking not applied to a %s-token step: num_prefills=%s "
+                    "num_decode_tokens=%s num_input_tokens=%s (mixed/padded steps stay unchunked).",
+                    metadata.num_actual_tokens,
+                    metadata.num_prefills,
+                    metadata.num_decode_tokens,
+                    metadata.num_input_tokens,
+                )
             return None
         if self.use_pcp or self.nope or seq_lens_cpu is None:
             return None
@@ -804,7 +815,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             qsl_cpu = getattr(common_attn_metadata, "query_start_loc", None)
         if not isinstance(qsl_cpu, torch.Tensor) or not isinstance(seq_lens_cpu, torch.Tensor):
             return None
-        chunk_size = int(ascend_config.attention_chunk_size)
         geometries = compute_sfa_chunk_geometries(
             qsl_cpu[: num_reqs + 1],
             seq_lens_cpu,
@@ -2005,15 +2015,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         indexer_attn_metadata = self._get_indexer_attn_metadata()
 
         # Chunked SFA prefill: pure prefill steps larger than
-        # attention_chunk_size run the whole stage list per token chunk. The
-        # NATIVE preprocess path is not chunked (its stages are inlined in
-        # the unchunked forward); MLAPO additionally caps the per-chunk token
-        # count at its fused-kernel limit.
+        # attention_chunk_size run the whole stage list per token chunk
+        # (every preprocess flavor incl. NATIVE; MLAPO additionally caps the
+        # per-chunk token count at its fused-kernel limit).
         chunk_plan = getattr(attn_metadata, "chunks", None)
-        if chunk_plan is not None and self.preprocess_type in (
-            PreprocessType.PROLOG_V3,
-            PreprocessType.MLAPO,
-        ):
+        if chunk_plan is not None:
             if self.runtime_has_indexer and getattr(indexer_attn_metadata, "chunks", None) is None:
                 logger.warning_once(
                     "SFA attention chunking skipped: the indexer metadata carries no chunk "
@@ -2294,7 +2300,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             chunk_tokens = c1 - c0
             hidden_states_k = hidden_states[c0:c1]
 
-            # ── fused q/kv preprocess + paged KV write for the chunk ──
+            # ── q/kv preprocess + paged KV write for the chunk ──
             with record_activation_substage("attn_qkv_proj", f"{layer_name}.attn.qkv_proj", num_tokens=chunk_tokens):
                 if self.preprocess_type == PreprocessType.PROLOG_V3:
                     _, ql_nope, q_pe, q_c = self._sfa_preprocess_prolog_v3(
@@ -2305,7 +2311,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         slot_mapping=_int64_kv_slots(self._get_sfa_kv_slot_mapping(chunk_md), chunk_md),
                         attn_metadata=chunk_md,
                     )
-                else:
+                elif self.preprocess_type == PreprocessType.MLAPO:
                     _, ql_nope, q_pe, q_c = self._sfa_preprocess_mlapo(
                         hidden_states=hidden_states_k,
                         kv_cache=kv_cache,
@@ -2314,6 +2320,41 @@ class AscendSFAImpl(MLAAttentionImpl):
                         slot_mapping=self._get_sfa_kv_slot_mapping(chunk_md),
                         num_input_tokens=chunk_tokens,
                         attn_metadata=chunk_md,
+                    )
+                else:
+                    # NATIVE chain, chunk rows + chunk rope/slot mapping. This
+                    # is the flavor quantized W4A8 layers resolve to (the
+                    # fused kernels only accept W8A8 weights).
+                    assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
+                    qkv_lora = self.fused_qkv_a_proj(hidden_states_k)[0]
+                    q_c, kv_no_split = qkv_lora.split(
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+                    )
+                    assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
+                    q_c = self.q_a_layernorm(q_c)
+                    cos_k, sin_k = chunk_md.cos, chunk_md.sin
+                    kv_outputs = self.exec_kv(
+                        kv_no_split, cos_k, sin_k, kv_cache, self._get_sfa_kv_slot_mapping(chunk_md), chunk_md
+                    )
+                    k_pe, k_nope = kv_outputs[:2]
+                    knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
+                    fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
+                        k_pe, k_nope, knope_scale, False
+                    )
+                    ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+                    if self.qk_rope_head_dim:
+                        q_pe = self.rope_single(q_pe, cos_k, sin_k)
+                    self._record_query_gather_context(ql_nope, q_pe, chunk_md)
+                    self._store_parallel_kv(
+                        k_pe,
+                        k_nope,
+                        knope_scale,
+                        fused_kv_no_split,
+                        kv_ag_handles,
+                        kv_cache,
+                        self._get_sfa_kv_slot_mapping(chunk_md),
+                        chunk_md,
+                        False,
                     )
 
             # ── indexer: k path -> cache write -> top-k for the chunk ──
