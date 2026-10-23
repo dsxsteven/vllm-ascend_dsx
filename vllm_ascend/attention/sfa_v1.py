@@ -28,6 +28,13 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.sfa_chunking import (
+    SFAChunkMeta,
+    SFAChunkPlan,
+    build_sfa_attn_metadata_chunk_views,
+    compute_sfa_chunk_geometries,
+    sfa_attention_chunking_eligible,
+)
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
@@ -752,7 +759,65 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     self.kv_cache_spec, self.vllm_config, self.device, self.nope_indexer, self.kernel_block_size
                 )
             self.nope_states[draft_index].prepare(metadata)
+        if draft_index is None:
+            chunk_plan = self._maybe_build_chunk_plan(common_attn_metadata, metadata, num_reqs, seq_lens_cpu)
+            if chunk_plan is not None:
+                metadata.chunks = chunk_plan  # type: ignore[attr-defined]
         return metadata
+
+    def _maybe_build_chunk_plan(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        metadata: AscendSFAMetadata,
+        num_reqs: int,
+        seq_lens_cpu: torch.Tensor | None,
+    ) -> SFAChunkPlan | None:
+        """Build the per-chunk plan for SFA attention chunking, if eligible.
+
+        Eligibility mirrors the impl-side gate: opt-in config, a pure prefill
+        step larger than the chunk size, no padding, and no parallel-layout
+        wrapper (PCP builds its own token addressing; chunk views address the
+        plain replicated stream). The indexer's builder independently derives
+        an equivalent geometry, exactly like sibling DSA-CP cache groups do.
+        """
+        try:
+            ascend_config = get_ascend_config()
+        except RuntimeError:
+            # Pre-init contexts (unit tests) have no AscendConfig; chunking
+            # is a deployment feature, treat it as disabled there.
+            return None
+        if not sfa_attention_chunking_eligible(
+            enable_attention_chunking=ascend_config.enable_attention_chunking,
+            attention_chunk_size=int(ascend_config.attention_chunk_size),
+            num_prefills=metadata.num_prefills,
+            num_decode_tokens=metadata.num_decode_tokens,
+            num_input_tokens=metadata.num_input_tokens,
+            num_actual_tokens=metadata.num_actual_tokens,
+        ):
+            return None
+        if self.use_pcp or self.nope or seq_lens_cpu is None:
+            return None
+        # Partial mocks (unit tests) stub the common metadata; only build a
+        # plan from real CPU tensors and fall back silently otherwise.
+        qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+        if not isinstance(qsl_cpu, torch.Tensor):
+            qsl_cpu = getattr(common_attn_metadata, "query_start_loc", None)
+        if not isinstance(qsl_cpu, torch.Tensor) or not isinstance(seq_lens_cpu, torch.Tensor):
+            return None
+        chunk_size = int(ascend_config.attention_chunk_size)
+        geometries = compute_sfa_chunk_geometries(
+            qsl_cpu[: num_reqs + 1],
+            seq_lens_cpu,
+            num_reqs=num_reqs,
+            num_actual_tokens=metadata.num_actual_tokens,
+            chunk_size=chunk_size,
+        )
+        plan = SFAChunkPlan(chunk_size=chunk_size, num_reqs=num_reqs)
+        for geometry, attn_view in zip(
+            geometries, build_sfa_attn_metadata_chunk_views(metadata, geometries), strict=True
+        ):
+            plan.chunks.append(SFAChunkMeta(geometry=geometry, attn_metadata=attn_view))
+        return plan
 
     def build_for_cudagraph_capture(
         self,
@@ -1592,21 +1657,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         """Allow an attention backend to supply indexer selection metadata."""
         return
 
-    def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
+    def _get_indexcache_topk_indices(self, num_tokens: int, offset: int = 0) -> torch.Tensor:
         if self.topk_indices_buffer is None:
             raise RuntimeError("IndexCache requires topk_indices_buffer when skip_topk is enabled.")
-        topk_indices = self.topk_indices_buffer[:num_tokens]
+        topk_indices = self.topk_indices_buffer[offset : offset + num_tokens]
         if topk_indices.dim() == 2:
             topk_indices = topk_indices.unsqueeze(1)
         return topk_indices
 
-    def _update_indexcache_topk_indices(self, topk_indices: torch.Tensor) -> None:
+    def _update_indexcache_topk_indices(self, topk_indices: torch.Tensor, offset: int = 0) -> None:
         if self.topk_indices_buffer is None:
             return
         num_tokens = topk_indices.shape[0]
         topk_tokens = topk_indices.shape[-1]
         topk_indices_to_cache = topk_indices
-        topk_indices_buffer = self.topk_indices_buffer[:num_tokens, :topk_tokens]
+        topk_indices_buffer = self.topk_indices_buffer[offset : offset + num_tokens, :topk_tokens]
         if topk_indices_to_cache.dim() == 3 and topk_indices_buffer.dim() == 2:
             assert topk_indices_to_cache.shape[1] == 1
             topk_indices_to_cache = topk_indices_to_cache.squeeze(1)
@@ -1939,6 +2004,42 @@ class AscendSFAImpl(MLAAttentionImpl):
         slot_mapping_sfa = self._get_sfa_kv_slot_mapping(attn_metadata)
         indexer_attn_metadata = self._get_indexer_attn_metadata()
 
+        # Chunked SFA prefill: pure prefill steps larger than
+        # attention_chunk_size run the whole stage list per token chunk. The
+        # NATIVE preprocess path is not chunked (its stages are inlined in
+        # the unchunked forward); MLAPO additionally caps the per-chunk token
+        # count at its fused-kernel limit.
+        chunk_plan = getattr(attn_metadata, "chunks", None)
+        if chunk_plan is not None and self.preprocess_type in (
+            PreprocessType.PROLOG_V3,
+            PreprocessType.MLAPO,
+        ):
+            if self.runtime_has_indexer and getattr(indexer_attn_metadata, "chunks", None) is None:
+                logger.warning_once(
+                    "SFA attention chunking skipped: the indexer metadata carries no chunk "
+                    "plan (layer_name=%s).",
+                    layer_name,
+                )
+            elif self.preprocess_type == PreprocessType.MLAPO and chunk_plan.chunk_size > MLAPO_MAX_SUPPORTED_TOKENS:
+                logger.warning_once(
+                    "SFA attention chunking skipped: MLAPO preprocess supports at most %s "
+                    "tokens, attention_chunk_size=%s (layer_name=%s).",
+                    MLAPO_MAX_SUPPORTED_TOKENS,
+                    chunk_plan.chunk_size,
+                    layer_name,
+                )
+            else:
+                return self._forward_attention_in_chunks(
+                    layer_name,
+                    hidden_states,
+                    gate_hidden_states,
+                    kv_cache,
+                    attn_metadata,
+                    indexer_attn_metadata,
+                    chunk_plan,
+                    output,
+                )
+
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = hidden_states.shape[0] if self.qk_rope_head_dim == 0 else attn_metadata.num_input_tokens
         parallel_context = self._get_parallel_forward_context(
@@ -2137,6 +2238,132 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_output,
                 output[:num_input_tokens],
                 parallel_context.gather_full_o_proj,
+            )
+
+        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+
+        return output
+
+    def _forward_attention_in_chunks(
+        self,
+        layer_name,
+        hidden_states: torch.Tensor,
+        gate_hidden_states: torch.Tensor | None,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        indexer_attn_metadata,
+        chunk_plan: SFAChunkPlan,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Chunked SFA prefill: run the full stage list per token chunk.
+
+        SFA shards heads, not tokens, so global- and local-side work
+        coincide: every chunk re-runs the fused preprocess (which writes the
+        chunk's paged KV rows), the lightning indexer (k path, indexer cache
+        write, top-k selection) and the sparse attention op on its own rows,
+        in chunk order. That keeps the causal contract of scheduler-level
+        chunked prefill — a chunk's queries only attend to keys at or before
+        the chunk end — while the per-chunk transient activations (q buffers,
+        indexer selects, sparse attention workspace) scale with
+        ``attention_chunk_size`` instead of the scheduler step size. The
+        o_proj runs once on the accumulated output, and shared top-k index
+        caches are written/read with per-chunk offsets so cross-layer index
+        sharing keeps working.
+        """
+        num_input_tokens = attn_metadata.num_input_tokens
+        indexer_chunk_views = None if indexer_attn_metadata is None else getattr(indexer_attn_metadata, "chunks", None)
+
+        # All chunks touch the caches; wait for the connector once up front
+        # instead of per chunk (the unchunked path waits before the first
+        # cache access of the layer).
+        wait_for_kv_layer_from_connector(layer_name)
+        if self.layerwise_kv_cache_hook is not None:
+            self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
+
+        attn_out_full = None
+        for chunk in chunk_plan.chunks:
+            geometry = chunk.geometry
+            c0, c1 = geometry.c0, geometry.c1
+            chunk_md = chunk.attn_metadata
+            chunk_tokens = c1 - c0
+            hidden_states_k = hidden_states[c0:c1]
+
+            # ── fused q/kv preprocess + paged KV write for the chunk ──
+            with record_activation_substage("attn_qkv_proj", f"{layer_name}.attn.qkv_proj", num_tokens=chunk_tokens):
+                if self.preprocess_type == PreprocessType.PROLOG_V3:
+                    _, ql_nope, q_pe, q_c = self._sfa_preprocess_prolog_v3(
+                        hidden_states=hidden_states_k,
+                        kv_cache=kv_cache,
+                        cos=chunk_md.cos,
+                        sin=chunk_md.sin,
+                        slot_mapping=_int64_kv_slots(self._get_sfa_kv_slot_mapping(chunk_md), chunk_md),
+                        attn_metadata=chunk_md,
+                    )
+                else:
+                    _, ql_nope, q_pe, q_c = self._sfa_preprocess_mlapo(
+                        hidden_states=hidden_states_k,
+                        kv_cache=kv_cache,
+                        cos=chunk_md.cos,
+                        sin=chunk_md.sin,
+                        slot_mapping=self._get_sfa_kv_slot_mapping(chunk_md),
+                        num_input_tokens=chunk_tokens,
+                        attn_metadata=chunk_md,
+                    )
+
+            # ── indexer: k path -> cache write -> top-k for the chunk ──
+            with record_activation_substage("attn_indexer", f"{layer_name}.attn.indexer", num_tokens=chunk_tokens):
+                if self.runtime_has_indexer:
+                    assert indexer_chunk_views is not None
+                    chunk_indexer_md = indexer_chunk_views[geometry.index]
+                    self._prepare_indexer_metadata(chunk_indexer_md, chunk_md)
+                    topk_indices = self.indexer(
+                        hidden_states_k,
+                        q_c,
+                        hidden_states_k,
+                        chunk_indexer_md,
+                        compute_topk=not self.skip_topk,
+                    )
+                    if self.skip_topk:
+                        topk_indices = self._get_indexcache_topk_indices(chunk_tokens, offset=c0)
+                    elif self.use_index_cache:
+                        self._update_indexcache_topk_indices(topk_indices, offset=c0)
+                elif self.skip_topk:
+                    topk_indices = self._get_indexcache_topk_indices(chunk_tokens, offset=c0)
+                else:
+                    raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
+
+            # ── sparse attention for the chunk's rows ──
+            with attention_transfer_window(), record_activation_substage(
+                "attn_sfa", f"{layer_name}.attn.sfa", num_tokens=chunk_tokens
+            ):
+                attn_output = self._execute_sparse_flash_attention_process(
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    topk_indices,
+                    chunk_md,
+                    chunk_md.cum_query_lens,
+                    chunk_md.seq_lens,
+                )
+                if attn_out_full is None:
+                    attn_out_full = attn_output.new_zeros(
+                        (num_input_tokens, *attn_output.shape[1:]),
+                    )
+                attn_out_full[c0:c1].copy_(attn_output)
+
+        # Every chunk's KV (main + indexer) has been scattered by this point;
+        # the connector can dispatch the PD pull.
+        notify_kv_cache_written(self.layer_name or "")
+
+        with record_activation_substage("attn_o_proj", f"{layer_name}.attn.o_proj"):
+            attn_output = self._v_up_proj(attn_out_full)
+            if gate_hidden_states is not None:
+                assert self.g_proj is not None
+                attn_output.mul_(torch.sigmoid(self.g_proj(gate_hidden_states.contiguous())[0]))
+            self._finalize_o_proj(
+                attn_output,
+                output[:num_input_tokens],
+                False,
             )
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

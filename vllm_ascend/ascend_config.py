@@ -1008,10 +1008,11 @@ class AscendConfig:
             if not self.enable_dsa_cp:
                 logger.warning_once(
                     "enable_attention_chunking only takes effect on the DSA-CP attention "
-                    "path (enable_dsa_cp=true, compress ratio 4); it is ignored otherwise."
+                    "path (enable_dsa_cp=true, compress ratio 4) or the SFA attention "
+                    "backend (base prefill layout); it is ignored otherwise."
                 )
             logger.info_once(
-                "[attention] DSA-CP attention token chunking is enabled for prefill: chunk_size=%s.",
+                "[attention] attention token chunking is enabled for prefill: chunk_size=%s.",
                 self.attention_chunk_size,
             )
 

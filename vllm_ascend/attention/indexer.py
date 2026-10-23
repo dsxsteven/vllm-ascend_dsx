@@ -36,6 +36,10 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
     get_sfa_dcp_max_local_block_table_cols,
     get_sfa_pcp_global_metadata,
 )
+from vllm_ascend.attention.sfa_chunking import (
+    build_sfa_indexer_metadata_chunk_views,
+    compute_sfa_chunk_geometries,
+)
 from vllm_ascend.attention.utils import split_decodes_and_prefills
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
@@ -1162,7 +1166,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
                 block_size,
             )
 
-        return AscendSFAIndexerMetadata(
+        metadata = AscendSFAIndexerMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             slot_mapping=slot_mapping,
             seq_lens=seq_lens,
@@ -1178,3 +1182,62 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             actual_seq_lengths_key=actual_seq_lengths_key,
             num_decode_tokens=num_decode_tokens,
         )
+        if not (self.use_pcp or self.use_dcp or self.use_dsa_cp):
+            chunk_views = self._maybe_build_chunk_views(common_attn_metadata, metadata, num_reqs)
+            if chunk_views is not None:
+                metadata.chunks = chunk_views  # type: ignore[attr-defined]
+        return metadata
+
+    def _maybe_build_chunk_views(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        metadata: AscendSFAIndexerMetadata,
+        num_reqs: int,
+    ) -> list | None:
+        """Attach per-chunk indexer views when SFA attention chunking is active.
+
+        Mirrors ``AscendSFAMetadataBuilder._maybe_build_chunk_plan``: the same
+        pure geometry is derived independently here (tiny CPU int work, like
+        sibling DSA-CP cache groups), and the impl pairs each chunk's
+        attention view with the same-indexed indexer view. Only the base
+        replicated layout is chunked — PCP/DCP/DSA-CP build their own token
+        addressing. The step-level prefill gating lives on the attention
+        side; when it opts out, these views simply stay unused.
+        """
+        try:
+            ascend_config = get_ascend_config()
+        except RuntimeError:
+            # Pre-init contexts (unit tests) have no AscendConfig; chunking
+            # is a deployment feature, treat it as disabled there.
+            return None
+        if not ascend_config.enable_attention_chunking:
+            return None
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        chunk_size = int(ascend_config.attention_chunk_size)
+        if num_actual_tokens <= chunk_size or common_attn_metadata.num_input_tokens != num_actual_tokens:
+            return None
+        # Partial mocks (unit tests) stub the common metadata; only build a
+        # plan from real CPU tensors and fall back silently otherwise.
+        qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+        if not isinstance(qsl_cpu, torch.Tensor):
+            qsl_cpu = getattr(common_attn_metadata, "query_start_loc", None)
+        if not isinstance(qsl_cpu, torch.Tensor):
+            return None
+        seq_lens_cpu_val = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        if not isinstance(seq_lens_cpu_val, torch.Tensor):
+            seq_lens_cpu_val = getattr(common_attn_metadata, "seq_lens_cpu", None)
+        if isinstance(seq_lens_cpu_val, torch.Tensor):
+            seq_lens_cpu = seq_lens_cpu_val[:num_reqs]
+        else:
+            seq_lens_raw = getattr(common_attn_metadata, "seq_lens", None)
+            if not isinstance(seq_lens_raw, torch.Tensor):
+                return None
+            seq_lens_cpu = seq_lens_raw[:num_reqs].cpu()
+        geometries = compute_sfa_chunk_geometries(
+            qsl_cpu[: num_reqs + 1],
+            seq_lens_cpu,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_actual_tokens,
+            chunk_size=chunk_size,
+        )
+        return build_sfa_indexer_metadata_chunk_views(metadata, geometries)
