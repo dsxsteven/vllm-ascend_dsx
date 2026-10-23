@@ -1342,6 +1342,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 
+
+    def _dump_exec_kv_inputs(self, tag, kv_no_split, cos, sin, slots, kv_cache):
+        """Debug-only input dump for npu_kv_rmsnorm_rope_cache (env-gated).
+
+        Syncs two .item() reads; only for diagnosing tiling failures.
+        """
+        import os, sys
+        if not os.getenv("VLLM_ASCEND_SFA_CHUNK_DUMP"):
+            return
+        print(
+            f"[SFA_CHUNK_DUMP] {tag} kv={tuple(kv_no_split.shape)}/{kv_no_split.dtype} "
+            f"stride={kv_no_split.stride()} contig={kv_no_split.is_contiguous()} "
+            f"cos={tuple(cos.shape)}/{cos.dtype} stride={cos.stride()} contig={cos.is_contiguous()} "
+            f"sin={tuple(sin.shape)}/{sin.dtype} contig={sin.is_contiguous()} "
+            f"slots={tuple(slots.shape)}/{slots.dtype} min={slots.min().item()} max={slots.max().item()} "
+            f"gamma={tuple(self.kv_a_layernorm.weight.shape)}/{self.kv_a_layernorm.weight.dtype} "
+            f"cache0={tuple(kv_cache[0].shape)}/{kv_cache[0].dtype} cache1={tuple(kv_cache[1].shape)}/{kv_cache[1].dtype}",
+            file=sys.stderr, flush=True,
+        )
+
     def exec_kv(
         self,
         kv_no_split: torch.Tensor,
@@ -2132,6 +2152,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Wait before the first main or indexer cache access.
                     self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
 
+                self._dump_exec_kv_inputs(
+                    "unchunked", kv_no_split, cos, sin, parallel_context.kv_slot_mapping, kv_cache
+                )
                 kv_outputs = self.exec_kv(
                     kv_no_split,
                     cos,
@@ -2333,9 +2356,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
                     q_c = self.q_a_layernorm(q_c)
                     cos_k, sin_k = chunk_md.cos, chunk_md.sin
-                    kv_outputs = self.exec_kv(
-                        kv_no_split, cos_k, sin_k, kv_cache, self._get_sfa_kv_slot_mapping(chunk_md), chunk_md
+                    chunk_slots = self._get_sfa_kv_slot_mapping(chunk_md)
+                    self._dump_exec_kv_inputs(
+                        f"chunk[{c0}:{c1}]", kv_no_split, cos_k, sin_k, chunk_slots, kv_cache
                     )
+                    kv_outputs = self.exec_kv(kv_no_split, cos_k, sin_k, kv_cache, chunk_slots, chunk_md)
                     k_pe, k_nope = kv_outputs[:2]
                     knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
                     fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
