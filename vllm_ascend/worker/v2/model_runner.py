@@ -348,7 +348,7 @@ class NPUModelRunner(GPUModelRunner):
             pcp_manager._sampling_hidden_restored = False
         self._restore_replicated_draft_target_states()
         scheduler_output = (
-            self.execute_model_state.scheduler_output
+            getattr(self.execute_model_state, "scheduler_output", None)
             if self.execute_model_state is not None
             else None
         )
