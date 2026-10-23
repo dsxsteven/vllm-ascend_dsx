@@ -808,6 +808,24 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             return None
         if self.use_pcp or self.nope or seq_lens_cpu is None:
             return None
+        # The chunk plan slices the step metadata row by row over the FULL
+        # token stream. Parallel layouts readdress tokens: the SFA-DCP
+        # builder (enable_dsa_cp with a TP-sized world) hands each rank a
+        # rank-local cos/sin/slot view of ~num_tokens/world rows, which a
+        # full-stream plan would mispair (kv rows vs rope rows mismatch
+        # crashes aclnnKvRmsNormRopeCache tiling). Verify the layout by
+        # value: full-stream metadata keeps chunking, anything else falls
+        # back to the unchunked forward.
+        if metadata.cos is not None and metadata.cos.shape[0] != metadata.num_actual_tokens:
+            logger.info_once(
+                "SFA attention chunking not applied: rank-local attention layout "
+                "(cos rows %s of %s tokens); chunking needs the replicated stream.",
+                metadata.cos.shape[0],
+                metadata.num_actual_tokens,
+            )
+            return None
+        if metadata.slot_mapping.shape[0] < metadata.num_actual_tokens:
+            return None
         # Partial mocks (unit tests) stub the common metadata; only build a
         # plan from real CPU tensors and fall back silently otherwise.
         qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
