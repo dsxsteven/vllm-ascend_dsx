@@ -2272,6 +2272,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         """
         num_input_tokens = attn_metadata.num_input_tokens
         indexer_chunk_views = None if indexer_attn_metadata is None else getattr(indexer_attn_metadata, "chunks", None)
+        logger.info_once(
+            "SFA attention chunking engaged: %s chunks for %s prefill tokens (chunk_size=%s).",
+            len(chunk_plan.chunks),
+            num_input_tokens,
+            chunk_plan.chunk_size,
+        )
 
         # All chunks touch the caches; wait for the connector once up front
         # instead of per chunk (the unchunked path waits before the first
