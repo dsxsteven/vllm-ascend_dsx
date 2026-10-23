@@ -1199,10 +1199,12 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         Mirrors ``AscendSFAMetadataBuilder._maybe_build_chunk_plan``: the same
         pure geometry is derived independently here (tiny CPU int work, like
         sibling DSA-CP cache groups), and the impl pairs each chunk's
-        attention view with the same-indexed indexer view. Only the base
-        replicated layout is chunked — PCP/DCP/DSA-CP build their own token
-        addressing. The step-level prefill gating lives on the attention
-        side; when it opts out, these views simply stay unused.
+        attention view with the same-indexed indexer view. Only full-stream
+        layouts are chunked — PCP/DCP readdress tokens across ranks and the
+        DSA-CP layout is rank-local, but with a single CP rank local IS the
+        full stream, which the value-level guard below detects. The
+        step-level prefill gating lives on the attention side; when it opts
+        out, these views simply stay unused.
         """
         try:
             ascend_config = get_ascend_config()
@@ -1212,10 +1214,22 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             return None
         if not ascend_config.enable_attention_chunking:
             return None
+        if self.use_pcp or self.use_dcp:
+            return None
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         chunk_size = int(ascend_config.attention_chunk_size)
         if num_actual_tokens <= chunk_size or common_attn_metadata.num_input_tokens != num_actual_tokens:
             return None
+        # The DSA-CP builder path is acceptable only when this rank's indexer
+        # layout still addresses the full token stream (CP size 1): the chunk
+        # geometry slices the replicated stream. A rank-local layout (CP > 1)
+        # does not match the attention-side plan and must stay unchunked.
+        if self.use_dsa_cp:
+            asl_q = metadata.actual_seq_lengths_query
+            if asl_q is None or not isinstance(asl_q, torch.Tensor):
+                return None
+            if int(asl_q[-1]) != num_actual_tokens:
+                return None
         # Partial mocks (unit tests) stub the common metadata; only build a
         # plan from real CPU tensors and fall back silently otherwise.
         qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)

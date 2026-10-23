@@ -1349,7 +1349,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         Syncs two .item() reads; only for diagnosing tiling failures.
         """
         import os, sys
-        if not os.getenv("VLLM_ASCEND_SFA_CHUNK_DUMP"):
+        if not os.getenv("SFA_CHUNK_DUMP"):
             return
         print(
             f"[SFA_CHUNK_DUMP] {tag} kv={tuple(kv_no_split.shape)}/{kv_no_split.dtype} "
