@@ -35,7 +35,11 @@ class TestEnvVariables(TestBase):
                     self.assertEqual(getattr(envs_ascend, var_name), var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if var_name == "VLLM_ASCEND_KVPOOL_RANGE_DEBUG":
+                    if var_name in {
+                        "VLLM_ASCEND_KVPOOL_RANGE_DEBUG",
+                        "VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL",
+                        "VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING",
+                    }:
                         test_vals = ["0", "1"]
                     elif "int(" in handler_source:
                         test_vals = ["123", "456"]

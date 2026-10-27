@@ -17,6 +17,7 @@
 
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend import envs
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
 if HAS_TRITON:
@@ -48,7 +49,9 @@ import vllm_ascend.patch.worker.patch_kimi_k25  # noqa
 import vllm_ascend.patch.worker.patch_eagle3_init  # noqa
 import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa
-import vllm_ascend.patch.worker.patch_dense_layer_sequence_parallel  # noqa
+
+if envs.VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL:
+    import vllm_ascend.patch.worker.patch_dense_layer_sequence_parallel  # noqa
 
 # vLLM's use_v2_model_runner may enable the v2 runner without the
 # VLLM_USE_V2_MODEL_RUNNER env var (e.g. based on model architecture).

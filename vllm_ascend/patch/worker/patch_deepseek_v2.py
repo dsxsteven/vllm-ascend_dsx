@@ -35,6 +35,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 
+from vllm_ascend import envs
 from vllm_ascend.utils import is_mtp_layer, should_reuse_topk
 from vllm_ascend.worker.v2 import pp_transport
 from vllm_ascend.worker.v2.pp_transport import (
@@ -428,18 +429,19 @@ def _patched_forward(
             )
         return pp_output
 
-    # if hidden_states.shape[0] != positions.shape[0]:
-    #     combined_states = torch.cat([hidden_states, residual], dim=-1)
-    #     combined_states = tensor_model_parallel_all_gather(combined_states, 0)
-    #     combined_states = combined_states[: positions.shape[0]]
-    #     hidden_size = self.hidden_size
-    #     hidden_states, residual = combined_states.split([hidden_size, hidden_size], dim=-1)
-    #     residual = residual.contiguous()
-
     if hidden_states.shape[0] != positions.shape[0]:
-        hidden_states, _ = self.norm(hidden_states, residual)
-        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-        hidden_states = hidden_states[: positions.shape[0]]
+        if envs.VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL:
+            # Normalize local shards before gathering to reduce peak memory.
+            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states[: positions.shape[0]]
+        else:
+            # Keep the original gather-before-norm path when the opt-in is off.
+            combined_states = torch.cat([hidden_states, residual], dim=-1)
+            combined_states = tensor_model_parallel_all_gather(combined_states, 0)
+            combined_states = combined_states[: positions.shape[0]]
+            hidden_states, residual = combined_states.split([self.hidden_size, self.hidden_size], dim=-1)
+            hidden_states, _ = self.norm(hidden_states, residual.contiguous())
     else:
         hidden_states, _ = self.norm(hidden_states, residual)
 
