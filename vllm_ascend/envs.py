@@ -93,12 +93,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # MLP keeps its TP-sharded weights and translates between the
     # sequence-sharded activations and full tokens with all_gather /
     # reduce_scatter around the sharded GEMMs.
-    # Default: 0 (dense layers keep the upstream full-token path). Valid
-    # values: 0 or 1.
+    # Also normalize the final sequence shards before gathering full tokens.
+    # Default: 0 (original methods and gather-before-final-RMSNorm path).
+    # Valid values: 0 or 1. Not sensitive. Set before worker startup;
+    # changing this option requires restarting the workers.
     "VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL": lambda: _strict_binary_env(
         "VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL"
     ),
-    # Additionally reduce-scatter the embedding output so the first decoder
+    # Additionally split the already-reduced embedding output so the first decoder
     # layer enters the sequence-parallel flow as well. Requires
     # VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL=1; setting this flag to 1
     # alone (without the flag above) is a no-op. Without this, layer 0
@@ -107,6 +109,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the activation peak (~187.5 MB for GLM-5.2 DSA at
     # max_num_batched_tokens=16000).
     # Default: 0 (embedding output stays full-token). Valid values: 0 or 1.
+    # Not sensitive. Set before worker startup; restart workers after changes.
     "VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING": lambda: _strict_binary_env("VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING"),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB

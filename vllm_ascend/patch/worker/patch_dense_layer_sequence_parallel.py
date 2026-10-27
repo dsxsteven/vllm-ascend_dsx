@@ -50,10 +50,13 @@ pad, then slice the rank's own rows - no communication). A
 first layer's input by tp_size (the residual stream carries the error;
 RMSNorm hides it in hidden_states only), producing garbage output.
 
-The two flags are independent controls:
+Set the flags before worker startup; changing them requires a worker restart:
 
 * ``VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL=0`` restores the upstream
-  dense-layer path completely (both patches become no-ops).
+  methods and the original gather-before-final-RMSNorm path completely.
+* ``VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL=1`` enables dense-layer SP
+  and final RMSNorm on local shards. Embeddings stay full-token unless
+  ``VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING=1`` is also set.
 * ``VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING=1`` without the flag above is
   a documented no-op: layer 0 must already run the sequence-parallel flow
   for a sharded embedding to be consumed correctly.
@@ -83,6 +86,7 @@ _SP_DENSE_MLP = "_vllm_ascend_sp_dense_mlp"
 
 _original_decoder_layer_init = DeepseekV2DecoderLayer.__init__
 _original_decoder_layer_forward = DeepseekV2DecoderLayer.forward
+_original_mlp_forward = DeepseekV2MLP.forward
 _original_embed_input_ids = DeepseekV2Model.embed_input_ids
 
 
@@ -114,11 +118,13 @@ def _patched_decoder_layer_init(self, vllm_config, prefix, *args, **kwargs):
 
 
 def _patched_mlp_forward(self, x, already_sequence_parallel: bool = False):
-    if not already_sequence_parallel or not getattr(self, _SP_DENSE_MLP, False):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+    if (
+        not envs.VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL
+        or not already_sequence_parallel
+        or not getattr(self, _SP_DENSE_MLP, False)
+    ):
+        # Preserve existing MLP behavior, including other installed patches.
+        return _original_mlp_forward(self, x)
     # SP dense MLP: translate to full tokens for the TP-sharded GEMMs and
     # back to the local token shard afterwards. The input size is the padded
     # per-rank token count produced by the attention-side reduce_scatter, so
@@ -137,7 +143,7 @@ def _patched_decoder_layer_forward(
     residual: torch.Tensor | None,
     llama_4_scaling: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if not envs.VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL:
+    if not envs.VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL or not getattr(self.mlp, _SP_DENSE_MLP, False):
         return _original_decoder_layer_forward(self, positions, hidden_states, residual, llama_4_scaling)
 
     full_num_tokens = positions.shape[0]
@@ -217,6 +223,8 @@ def _patched_embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
     first_layer = layers[0] if layers else None
     if not isinstance(first_layer, DeepseekV2DecoderLayer):
         return hidden_states
+    if not getattr(first_layer.mlp, _SP_DENSE_MLP, False):
+        return hidden_states
     if not getattr(first_layer, "use_sequence_parallel_moe", False):
         return hidden_states
     tp_size = get_tensor_model_parallel_world_size()
@@ -236,7 +244,10 @@ def _patched_embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
     return sequence_parallel_chunk(hidden_states)
 
 
-DeepseekV2DecoderLayer.__init__ = _patched_decoder_layer_init
-DeepseekV2DecoderLayer.forward = _patched_decoder_layer_forward
-DeepseekV2MLP.forward = _patched_mlp_forward
-DeepseekV2Model.embed_input_ids = _patched_embed_input_ids
+# Do not replace upstream methods at all when disabled, including direct imports.
+if envs.VLLM_ASCEND_DENSE_LAYERS_SEQUENCE_PARALLEL:
+    DeepseekV2DecoderLayer.__init__ = _patched_decoder_layer_init
+    DeepseekV2DecoderLayer.forward = _patched_decoder_layer_forward
+    DeepseekV2MLP.forward = _patched_mlp_forward
+    if envs.VLLM_ASCEND_SEQUENCE_PARALLEL_EMBEDDING:
+        DeepseekV2Model.embed_input_ids = _patched_embed_input_ids
