@@ -2027,11 +2027,9 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         self._maybe_all_gather_o_proj_full_weight(full_gather_wo_a_enabled)
         record_attention_compute_start()
 
-        attn_out_full = torch.zeros(
-            (hidden_states_local.shape[0], self.num_heads, self.head_dim),
-            dtype=hidden_states_local.dtype,
-            device=hidden_states_local.device,
-        )
+        # Materialize the full output only after the first local attention
+        # call has finished; early global-only chunks need no accumulator.
+        attn_out_full = None
         ori_win_left = self.window_size - 1 if swa_req_metadata.ori_win_left is None else swa_req_metadata.ori_win_left
         ori_win_right = 0 if swa_req_metadata.ori_win_right is None else swa_req_metadata.ori_win_right
 
@@ -2055,6 +2053,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                     partial_slice=[self.nope_head_dim, self.head_dim],
                 )
                 kv_plan.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_slot_mapping[c0:c1])
+                del kv
 
             # ── global: indexer cache update for the chunk's tokens ──
             assert layer_metadata.indexer_cache is not None
@@ -2089,6 +2088,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                 )
                 if self.indexer.use_index_cache:
                     self.indexer._update_cached_topk_indices(compress_topk_idxs, offset=l0)
+                del qr_local, qr_pertoken_scale_local
 
             # ── global: compressor + compressed KV scatter ──
             compressor_attn_metadata = layer_metadata.compressor_cache
@@ -2124,6 +2124,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
             if compressed_kv.numel() == 0:
                 compressed_kv = None
             kv_plan.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+            del compressed_kv
 
             # ── local: sparse attention for this rank's chunk rows ──
             if l1 > l0:
@@ -2154,8 +2155,27 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                         layout_kv=_dsa_layout_kv(self.vllm_config),
                         **extra_attn_kwargs,
                     )[0]
-                attn_out_full[l0:l1].copy_(attn_output)
+                # Release consumed inputs before allocating/copying the full
+                # output. The stream-ordered allocator retains device safety.
+                del q, compress_topk_idxs
+                if attn_out_full is None and l0 == 0 and l1 == hidden_states_local.shape[0]:
+                    # This chunk covers the entire (unpadded) local slice.
+                    attn_out_full = attn_output
+                else:
+                    if attn_out_full is None:
+                        attn_out_full = hidden_states_local.new_zeros(
+                            (hidden_states_local.shape[0], self.num_heads, self.head_dim)
+                        )
+                    attn_out_full[l0:l1].copy_(attn_output)
+                # Assignment on the next iteration otherwise retains the old
+                # output until the next attention call has returned.
+                del attn_output
 
+        if attn_out_full is None:
+            # A CP rank containing only padding still returns zero-filled rows.
+            attn_out_full = hidden_states_local.new_zeros(
+                (hidden_states_local.shape[0], self.num_heads, self.head_dim)
+            )
         notify_kv_cache_written(layer_name)
         return attn_out_full
 

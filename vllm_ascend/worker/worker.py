@@ -851,6 +851,8 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+            from vllm_ascend.profiler.layer_scopes import install_layer_scopes
+            install_layer_scopes(self.model_runner.get_model())
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
