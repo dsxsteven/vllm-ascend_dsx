@@ -424,6 +424,8 @@ class AlltoAllCommImpl(MoECommMethod):
     have better performance than AllGatherCommImpl when DP size > 1.
     """
 
+    token_dispatcher: TokenDispatcherWithAll2AllV
+
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
 
@@ -550,11 +552,13 @@ class AlltoAllCommImpl(MoECommMethod):
                     f"moe.chunk.{chunk_idx + 1}.combine",
                     num_tokens=mlp_output.shape[0],
                 ):
-                    chunk_routed_out = self.token_dispatcher.token_combine(
-                        hidden_states=mlp_output,
-                        combine_metadata=token_dispatch_output.combine_metadata,
-                    )
-                del mlp_output, token_dispatch_output
+                    combine_metadata = token_dispatch_output.combine_metadata
+                    send_states = self.token_dispatcher.prepare_combine_input(mlp_output, combine_metadata)
+                    # Drop the GMM output before allocating the receive buffer. If
+                    # no unpermute was needed, send_states still owns the input.
+                    del mlp_output
+                    chunk_routed_out = self.token_dispatcher.combine_prepared(send_states, combine_metadata)
+                del send_states, combine_metadata, token_dispatch_output
 
                 if routed_out is None:
                     routed_out = chunk_routed_out.new_empty((num_tokens, *chunk_routed_out.shape[1:]))

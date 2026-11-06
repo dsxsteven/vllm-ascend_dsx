@@ -1,3 +1,4 @@
+import weakref
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -23,7 +24,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     MoECommMethod,
 )
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
+from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAll2AllV, TokenDispatcherWithMC2
 from vllm_ascend.quantization.methods.base import QuantType
 
 
@@ -665,6 +666,8 @@ class TestMoECommMethod(TestBase):
         self.mock_ascend_config.ffn_chunk_size = 4
 
         dispatch_calls = []
+        gmm_refs = []
+        exchange_calls = []
 
         def fake_dispatch(token_dispatch_input):
             hs = token_dispatch_input.hidden_states
@@ -672,26 +675,44 @@ class TestMoECommMethod(TestBase):
             assert token_dispatch_input.routing.mc2_mask.shape[0] == hs.shape[0]
             assert token_dispatch_input.routing.pertoken_scale.shape[0] == hs.shape[0]
             dispatch_calls.append(hs.shape[0])
+            # Alternate reordered and already-in-send-order expert outputs.
+            reverse = torch.arange(hs.shape[0] - 1, -1, -1) if len(dispatch_calls) % 2 else None
             return MoETokenDispatchOutput(
-                hidden_states=hs.clone(),
+                hidden_states=hs.index_select(0, reverse) if reverse is not None else hs.clone(),
                 group_list=torch.tensor([hs.shape[0]]),
                 group_list_type=1,
-                combine_metadata=MagicMock(expanded_row_idx=None),
+                combine_metadata=MagicMock(reversed_global_input_permutation_mapping=reverse),
                 dynamic_scale=None,
                 topk_scales=None,
             )
 
-        mock_td_instance = MagicMock()
-        mock_td_instance.token_dispatch.side_effect = fake_dispatch
-        mock_td_instance.token_combine.side_effect = lambda hidden_states, combine_metadata: hidden_states
-        mock_token_dispatcher.return_value = mock_td_instance
+        dispatcher = object.__new__(TokenDispatcherWithAll2AllV)
+        dispatcher.num_local_experts = 2
+        dispatcher.token_dispatch = fake_dispatch
+        dispatcher._combine_postprocess = lambda received, metadata: received
+        mock_token_dispatcher.return_value = dispatcher
+
+        def fake_exchange(send_states, output_splits, input_splits, group):
+            reordered = len(dispatch_calls) % 2 == 1
+            if reordered:
+                assert gmm_refs[-1]() is None, "GMM output still live at receive allocation"
+            else:
+                assert gmm_refs[-1]() is send_states
+            exchange_calls.append(send_states.shape[0])
+            received = torch.empty_like(send_states)
+            # Read the send buffer only at wait(), as an asynchronous transfer may do.
+            handle = MagicMock()
+            handle.wait.side_effect = lambda: received.copy_(send_states)
+            return send_states, received, handle
 
         comm_impl = AlltoAllCommImpl(self.moe_config)
         apply_calls = []
 
         def fake_apply_mlp(value):
             apply_calls.append(value.hidden_states.shape[0])
-            return (value.hidden_states.to(torch.bfloat16) * 2), f"gmm2_evt_{len(apply_calls)}"
+            output = value.hidden_states.to(torch.bfloat16) * 2
+            gmm_refs.append(weakref.ref(output))
+            return output, f"gmm2_evt_{len(apply_calls)}"
 
         comm_impl._apply_mlp = fake_apply_mlp
 
@@ -700,13 +721,22 @@ class TestMoECommMethod(TestBase):
         mock_stream.return_value.record_event.side_effect = stream_events
 
         hidden_states = torch.arange(72, dtype=torch.bfloat16).reshape(9, 8)
-        with patch("torch.npu.current_stream", mock_stream):
+        with (
+            patch("torch.npu.current_stream", mock_stream),
+            patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_ep_group"),
+            patch("vllm_ascend.ops.fused_moe.token_dispatcher.async_all_to_all", new=fake_exchange),
+            patch(
+                "vllm_ascend.ops.fused_moe.token_dispatcher.torch_npu.npu_moe_token_unpermute",
+                new=lambda states, reverse: states.index_select(0, reverse),
+                create=True,
+            ),
+        ):
             result = comm_impl.fused_experts(fused_experts_input=self._make_e2e_fused_input(hidden_states))
 
         # 9 tokens with chunk_size=4 -> K=3 balanced chunks of [3, 3, 3].
         assert dispatch_calls == [3, 3, 3]
         assert apply_calls == [3, 3, 3]
-        assert mock_td_instance.token_combine.call_count == 3
+        assert exchange_calls == [3, 3, 3]
         # Partial chunk outputs are assembled into one full routed_out.
         torch.testing.assert_close(result.routed_out, hidden_states * 2)
         # Per-expert token counts are summed across chunks for EPLB heat.
@@ -770,7 +800,8 @@ class TestMoECommMethod(TestBase):
 
         mock_td_instance = MagicMock()
         mock_td_instance.token_dispatch.side_effect = fake_dispatch
-        mock_td_instance.token_combine.side_effect = lambda hidden_states, combine_metadata: hidden_states
+        mock_td_instance.prepare_combine_input.side_effect = lambda states, metadata: states
+        mock_td_instance.combine_prepared.side_effect = lambda states, metadata: states
         mock_token_dispatcher.return_value = mock_td_instance
 
         def fake_all_reduce(payload, op=None, group=None):
@@ -799,7 +830,7 @@ class TestMoECommMethod(TestBase):
 
         # K=5 uniform chunks; this rank splits 9 tokens into [2,2,2,2,1].
         assert dispatch_calls == [2, 2, 2, 2, 1]
-        assert mock_td_instance.token_combine.call_count == 5
+        assert mock_td_instance.combine_prepared.call_count == 5
         assert result.expert_tokens.tolist() == [9]
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
