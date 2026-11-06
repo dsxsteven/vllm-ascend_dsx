@@ -559,23 +559,21 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
     def token_combine(self, hidden_states, combine_metadata, bias=None):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
-        # 1. Preprocess using metadata
-        hidden_states = self._combine_preprocess(hidden_states, combine_metadata)
+        hidden_states = self.prepare_combine_input(hidden_states, combine_metadata)
+        return self.combine_prepared(hidden_states, combine_metadata)
 
-        # 2. AllToAll
+    def combine_prepared(self, send_states: torch.Tensor, combine_metadata: MoEAllToAllCombineMetadata) -> torch.Tensor:
+        """Exchange tokens in send order, then restore local token order and weights."""
         _, permutated_local_input_tokens, handle = async_all_to_all(
-            hidden_states,
+            send_states,
             combine_metadata.input_splits,
             combine_metadata.output_splits,
             self.ep_group,
         )
         handle.wait()
-        hidden_states.untyped_storage().resize_(0)
+        send_states.untyped_storage().resize_(0)
 
-        # 3. Postprocess using metadata
-        output = self._combine_postprocess(permutated_local_input_tokens, combine_metadata)
-
-        return output
+        return self._combine_postprocess(permutated_local_input_tokens, combine_metadata)
 
     def _dispatch_preprocess(self, hidden_states, topk_ids):
         hidden_shape = hidden_states.shape
@@ -697,10 +695,10 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             )
         return global_input_tokens, dynamic_scale_after_all2all, reversed_global_input_permutation_mapping
 
-    def _combine_preprocess(
+    def prepare_combine_input(
         self, hidden_states: torch.Tensor, combine_metadata: MoEAllToAllCombineMetadata
     ) -> torch.Tensor:
-        # Unpermutation 2: expert output to AlltoAll input
+        """Return the AllToAll send tensor, reusing the expert output when already in send order."""
         rev_global = combine_metadata.reversed_global_input_permutation_mapping
         if hidden_states.shape[0] > 0 and self.num_local_experts > 1 and rev_global is not None:
             hidden_states = torch_npu.npu_moe_token_unpermute(hidden_states, rev_global)
