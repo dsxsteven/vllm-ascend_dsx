@@ -546,19 +546,27 @@ class AlltoAllCommImpl(MoECommMethod):
                     num_tokens=mlp_compute_input.hidden_states.shape[0],
                 ):
                     mlp_output, before_gmm2_evt = self._apply_mlp_dispatched(mlp_compute_input, quant_method)
+                combine_metadata = token_dispatch_output.combine_metadata
+                del mlp_compute_input, token_dispatch_output
                 before_combine_evt = torch.npu.current_stream().record_event()
                 with record_moe_substage(
                     "combine",
                     f"moe.chunk.{chunk_idx + 1}.combine",
                     num_tokens=mlp_output.shape[0],
                 ):
-                    combine_metadata = token_dispatch_output.combine_metadata
-                    send_states = self.token_dispatcher.prepare_combine_input(mlp_output, combine_metadata)
-                    # Drop the GMM output before allocating the receive buffer. If
-                    # no unpermute was needed, send_states still owns the input.
-                    del mlp_output
-                    chunk_routed_out = self.token_dispatcher.combine_prepared(send_states, combine_metadata)
-                del send_states, combine_metadata, token_dispatch_output
+                    # Hidden size and dtype are model-wide. Never vary the number
+                    # of EP collectives by this rank's routed token count.
+                    if mlp_output.shape[1] == 4096 and mlp_output.dtype == torch.bfloat16:
+                        received = self.token_dispatcher.exchange_combine_columns(mlp_output, combine_metadata)
+                        del mlp_output
+                        chunk_routed_out = self.token_dispatcher._combine_postprocess(received, combine_metadata)
+                        del received
+                    else:
+                        send_states = self.token_dispatcher.prepare_combine_input(mlp_output, combine_metadata)
+                        del mlp_output
+                        chunk_routed_out = self.token_dispatcher.combine_prepared(send_states, combine_metadata)
+                        del send_states
+                del combine_metadata
 
                 if routed_out is None:
                     routed_out = chunk_routed_out.new_empty((num_tokens, *chunk_routed_out.shape[1:]))

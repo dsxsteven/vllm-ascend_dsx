@@ -1598,7 +1598,9 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         self.cv_wq_a = CVLinearWrapper(self.wq_a)
         self.cv_wkv = CVLinearWrapper(self.wkv)
         self.cv_wq_b = CVLinearWrapper(self.wq_b)
-        self.multistream_dsv4_dsa_overlap = get_ascend_config().multistream_dsv4_dsa_overlap
+        ascend_config = get_ascend_config()
+        self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
+        self.o_proj_chunk_size = ascend_config.attention_chunk_size if ascend_config.enable_attention_chunking else 0
         if self.multistream_dsv4_dsa_overlap and is_a5_bf16_kv_enabled(self.vllm_config):
             self.multistream_dsv4_dsa_overlap = False
 
@@ -1877,16 +1879,31 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
             common_attn_metadata,
             skip_all_to_all=full_gather_wo_a_enabled,
         )
+        # After the layout exchange only its result is used. On the alias path
+        # o_proj_input itself keeps the original storage alive.
+        del local_attn_output
         # Keep gathered projection weights alive until all asynchronous NPU
         # consumers, including reduce-scatter and the output copy, are queued.
         # V4.1 calls _forward_o_proj only without temporary gathered weights.
         if full_gather_wo_a_enabled:
             self._switch_o_proj_to_full_weight()
         try:
-            projected_output = self._forward_o_proj(o_proj_input, full_gather_wo_a_enabled=full_gather_wo_a_enabled)
-            if need_gather_q_kv and not full_gather_wo_a_enabled:
-                projected_output = sp_reduce_scatter(projected_output)
-            output[...] = projected_output
+            sp_output = need_gather_q_kv and not full_gather_wo_a_enabled
+            if (
+                sp_output
+                and not is_decode
+                and self.tp_size > 1
+                and self.tp_size <= self.o_proj_chunk_size < o_proj_input.shape[0]
+                and o_proj_input.shape[0] == self.tp_size * output.shape[0]
+                and not self.wo_b.reduce_results
+                and getattr(getattr(self.wo_b, "weight", None), "dtype", None) == torch.bfloat16
+            ):
+                self._forward_o_proj(o_proj_input, output, sp_chunk_size=self.o_proj_chunk_size)
+            else:
+                projected_output = self._forward_o_proj(o_proj_input, full_gather_wo_a_enabled=full_gather_wo_a_enabled)
+                if sp_output:
+                    projected_output = sp_reduce_scatter(projected_output)
+                output[...] = projected_output
         finally:
             if full_gather_wo_a_enabled:
                 self._switch_o_proj_to_local_weight()
@@ -1897,7 +1914,12 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
 
     @profile_activation("attn_o_proj")
     def _forward_o_proj(
-        self, o_proj_input: torch.Tensor, output: torch.Tensor | None = None, *, full_gather_wo_a_enabled: bool = False
+        self,
+        o_proj_input: torch.Tensor,
+        output: torch.Tensor | None = None,
+        *,
+        full_gather_wo_a_enabled: bool = False,
+        sp_chunk_size: int = 0,
     ) -> torch.Tensor:
         """Project with the active weights; the caller owns their lifetime."""
         num_tokens = o_proj_input.shape[0]
@@ -1937,6 +1959,18 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                 batch_split_factor=1,
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
+        if sp_chunk_size:
+            assert output is not None
+            # Each reduce-scatter receives the same span from every destination's
+            # contiguous token range, in TP rank order, including the short tail.
+            rows_by_rank = o_proj_input.reshape(self.tp_size, output.shape[0], -1)
+            step = max(1, sp_chunk_size // self.tp_size)
+            for start in range(0, output.shape[0], step):
+                tile = rows_by_rank[:, start : start + step].reshape(-1, o_proj_input.shape[-1])
+                partial = self._apply_wo_b(tile, False)
+                output[start : start + step].copy_(sp_reduce_scatter(partial))
+                del partial, tile
+            return output
         projected_output = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
         if output is None:
             return projected_output
@@ -2173,9 +2207,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
 
         if attn_out_full is None:
             # A CP rank containing only padding still returns zero-filled rows.
-            attn_out_full = hidden_states_local.new_zeros(
-                (hidden_states_local.shape[0], self.num_heads, self.head_dim)
-            )
+            attn_out_full = hidden_states_local.new_zeros((hidden_states_local.shape[0], self.num_heads, self.head_dim))
         notify_kv_cache_written(layer_name)
         return attn_out_full
 
