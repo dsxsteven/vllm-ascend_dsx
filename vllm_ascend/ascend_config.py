@@ -585,8 +585,9 @@ class AscendConfig:
     """Opt in to DSA-CP sparse attention token chunking for prefill steps
     (q prolog + KV/indexer/compressor cache writes + top-k + sparse
     attention run per token chunk to cap attention activation memory).
-    Requires ``enforce_eager=true`` and ``enable_dsa_cp=true`` (compress
-    ratio 4 models only). See ``attention_chunk_size``."""
+    The sparse compute path requires compression ratio 4. DSA-CP sequence
+    parallel BF16 output projection can also tile other ratios. Both require
+    eager mode. See ``attention_chunk_size``."""
     attention_chunk_size: int = 8192
     """Global token chunk size for attention chunking when
     ``enable_attention_chunking`` is set. Must be positive."""
@@ -990,9 +991,7 @@ class AscendConfig:
 
         if self.serving_peak_request_topk < 0:
             raise ValueError("serving_peak_request_topk must be non-negative")
-        if self.serving_peak_request_topk and not (
-            self.activation_peak_debug_serving or self.serving_peak_debug
-        ):
+        if self.serving_peak_request_topk and not (self.activation_peak_debug_serving or self.serving_peak_debug):
             logger.warning_once(
                 "serving_peak_request_topk is set but no serving activation diagnostic "
                 "(activation_peak_debug_serving/serving_peak_debug) is enabled; "

@@ -575,6 +575,23 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
         return self._combine_postprocess(permutated_local_input_tokens, combine_metadata)
 
+    def exchange_combine_columns(
+        self, expert_output: torch.Tensor, combine_metadata: MoEAllToAllCombineMetadata
+    ) -> torch.Tensor:
+        """Restore send order and exchange hidden columns without a second full expert output."""
+        received = expert_output.new_empty((sum(combine_metadata.input_splits), expert_output.shape[1]))
+        for start in range(0, expert_output.shape[1], 1024):
+            columns = expert_output[:, start : start + 1024].contiguous()
+            send = self.prepare_combine_input(columns, combine_metadata)
+            del columns
+            send, part, handle = async_all_to_all(
+                send, combine_metadata.input_splits, combine_metadata.output_splits, self.ep_group
+            )
+            handle.wait()
+            received[:, start : start + 1024].copy_(part)
+            del send, part, handle
+        return received
+
     def _dispatch_preprocess(self, hidden_states, topk_ids):
         hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
