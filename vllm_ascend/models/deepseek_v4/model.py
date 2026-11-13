@@ -824,7 +824,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         with attention_peak_context:
             with record_activation_substage("attn_hc_pre"):
-                residual = hidden_states.clone()
+                # HC pre/post read their inputs and allocate separate outputs.
+                # Keep the input alive through HC post without duplicating it;
+                # retain the original copy behavior for noncontiguous layouts.
+                residual = hidden_states if hidden_states.is_contiguous() else hidden_states.clone()
                 full_num_tokens = positions.shape[0]
                 hidden_states, post, comb = self.hc_pre(
                     hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -865,7 +868,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 else nullcontext()
             )
             with ffn_hc_pre_context:
-                residual = hidden_states.clone()
+                # As above, HC pre/post do not mutate the residual storage.
+                residual = hidden_states if hidden_states.is_contiguous() else hidden_states.clone()
                 hidden_states, post, comb = self.hc_pre(
                     hidden_states,
                     self.hc_ffn_fn,
@@ -1146,6 +1150,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     llama_4_scaling,
                     input_ids=input_ids,
                 )
+                # HC post has consumed this layer's residual; the next layer
+                # creates its own. Do not retain the old buffer across layers.
+                residual = None
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_state = hidden_states.mean(dim=1)
                 if self.use_sequence_parallel_moe:
