@@ -518,6 +518,7 @@ class AlltoAllCommImpl(MoECommMethod):
         group_list_type = 1
         before_gmm2_evt = None
         before_combine_evt = None
+        shared_activation_overlap_start_evt = None
 
         for chunk_idx, (start, end) in enumerate(ranges):
             with record_moe_substage(
@@ -540,6 +541,11 @@ class AlltoAllCommImpl(MoECommMethod):
                     token_dispatch_output = self.token_dispatcher.token_dispatch(
                         token_dispatch_input=token_dispatch_input
                     )
+
+                if shared_activation_overlap_start_evt is None and self.shared_activation_overlaps_routed_gmm1:
+                    # Match the upstream staged All2All contract: shared
+                    # activation can overlap the first chunk's routed GMM1.
+                    shared_activation_overlap_start_evt = torch.npu.current_stream().record_event()
 
                 log_mtp_moe_chunk_detail(
                     chunk_idx=chunk_idx,
@@ -599,11 +605,14 @@ class AlltoAllCommImpl(MoECommMethod):
                         expert_tokens += chunk_group_list
 
         assert routed_out is not None
+        if shared_activation_overlap_start_evt is None:
+            shared_activation_overlap_start_evt = before_gmm2_evt
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_dispatch_evt,
             before_gmm2_evt=before_gmm2_evt,
             before_combine_evt=before_combine_evt,
+            shared_activation_overlap_start_evt=shared_activation_overlap_start_evt,
             group_list_type=group_list_type,
             expert_tokens=expert_tokens,
         )

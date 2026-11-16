@@ -689,8 +689,10 @@ class TestMoECommMethod(TestBase):
         dispatch_calls = []
         gmm_refs = []
         exchange_calls = []
+        timeline = []
 
         def fake_dispatch(token_dispatch_input):
+            timeline.append("dispatch")
             hs = token_dispatch_input.hidden_states
             # Routing side-inputs must be sliced alongside the token dim.
             assert token_dispatch_input.routing.mc2_mask.shape[0] == hs.shape[0]
@@ -730,6 +732,7 @@ class TestMoECommMethod(TestBase):
         apply_calls = []
 
         def fake_apply_mlp(value):
+            timeline.append("mlp")
             apply_calls.append(value.hidden_states.shape[0])
             output = value.hidden_states.to(torch.bfloat16) * 2
             gmm_refs.append(weakref.ref(output))
@@ -737,9 +740,15 @@ class TestMoECommMethod(TestBase):
 
         comm_impl._apply_mlp = fake_apply_mlp
 
-        stream_events = ["evt_dispatch", "evt_combine_0", "evt_combine_1", "evt_combine_2"]
+        stream_events = iter(["evt_dispatch", "evt_activation", "evt_combine_0", "evt_combine_1", "evt_combine_2"])
+
+        def record_event():
+            event = next(stream_events)
+            timeline.append(event)
+            return event
+
         mock_stream = MagicMock()
-        mock_stream.return_value.record_event.side_effect = stream_events
+        mock_stream.return_value.record_event.side_effect = record_event
 
         hidden_states = torch.arange(72, dtype=torch.bfloat16).reshape(9, 8)
         with (
@@ -765,6 +774,10 @@ class TestMoECommMethod(TestBase):
         assert result.group_list_type == 1
         # Earliest dispatch event, latest gmm2/combine events.
         assert result.before_dispatch_evt == "evt_dispatch"
+        # The upstream shared-expert consumer requires this distinct milestone.
+        # It starts at the first routed GMM1, after that chunk's dispatch.
+        assert result.shared_activation_overlap_start_evt == "evt_activation"
+        assert timeline[:5] == ["evt_dispatch", "dispatch", "evt_activation", "mlp", "evt_combine_0"]
         assert result.before_gmm2_evt == "gmm2_evt_3"
         assert result.before_combine_evt == "evt_combine_2"
 
