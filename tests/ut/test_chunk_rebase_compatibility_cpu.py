@@ -13,6 +13,26 @@ import torch
 ROOT = Path(__file__).resolve().parents[2] / "vllm_ascend"
 
 
+def test_hc_head_accepts_empty_token_batch(monkeypatch):
+    path = ROOT / "models/deepseek_v4/model.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DeepseekV4Model")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "hc_head")
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(current_stream=lambda: SimpleNamespace(synchronize=lambda: None)), raising=False
+    )
+    # Empty batches must not need weights, allocate a cast cache or enter a
+    # range with a zero step; the return keeps the input device and dtype.
+    model = SimpleNamespace()
+    inputs = torch.empty(0, 4, 8, dtype=torch.bfloat16)
+    output = namespace["hc_head"](model, inputs, None, None, None)
+    assert output.shape == (0, 8)
+    assert output.dtype == inputs.dtype and output.device == inputs.device
+    assert not hasattr(model, "_hc_fn_cast")
+
+
 def load_forward(file, cls_name, namespace):
     path = ROOT / file
     tree = ast.parse(path.read_text(encoding="utf-8"))

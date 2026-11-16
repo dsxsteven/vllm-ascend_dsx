@@ -1050,6 +1050,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         shape, dtype = x.size(), x.dtype
         num_tokens = shape[0]
+        if num_tokens == 0:
+            return x.new_empty((0, shape[2]))
         chunk = min(self.HC_HEAD_CHUNK, num_tokens)
 
         # Pre-cast weight to input dtype ONCE — per-call .to() creates a
