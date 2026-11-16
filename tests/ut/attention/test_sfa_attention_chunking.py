@@ -129,9 +129,7 @@ class TestSfaChunkGeometries:
         """Non-CP SFA: every rank holds the whole stream, so the CP-local
         slice of each chunk is the chunk itself."""
         qsl, seq_lens = _make_batch([12000, 8000], [5000, 200])
-        geometries = compute_sfa_chunk_geometries(
-            qsl, seq_lens, num_reqs=2, num_actual_tokens=20000, chunk_size=8192
-        )
+        geometries = compute_sfa_chunk_geometries(qsl, seq_lens, num_reqs=2, num_actual_tokens=20000, chunk_size=8192)
         assert [(g.c0, g.c1) for g in geometries] == [(0, 8192), (8192, 16384), (16384, 20000)]
         for g in geometries:
             assert (g.l0, g.l1) == (g.c0, g.c1)
@@ -156,9 +154,7 @@ class TestSfaAttnMetadataChunkViews:
     def test_views_slice_and_rebase(self):
         qsl, seq_lens = _make_batch([12000, 8000], [5000, 200])
         metadata = _make_attn_metadata(qsl, seq_lens)
-        geometries = compute_sfa_chunk_geometries(
-            qsl, seq_lens, num_reqs=2, num_actual_tokens=20000, chunk_size=8192
-        )
+        geometries = compute_sfa_chunk_geometries(qsl, seq_lens, num_reqs=2, num_actual_tokens=20000, chunk_size=8192)
         views = build_sfa_attn_metadata_chunk_views(metadata, geometries)
         assert len(views) == 3
         total = 0
@@ -183,9 +179,7 @@ class TestSfaAttnMetadataChunkViews:
         is capped at the tokens visible at the chunk end."""
         qsl, seq_lens = _make_batch([10000], [3000])  # one 10k prefill, 3k context
         metadata = _make_attn_metadata(qsl, seq_lens)
-        geometries = compute_sfa_chunk_geometries(
-            qsl, seq_lens, num_reqs=1, num_actual_tokens=10000, chunk_size=4096
-        )
+        geometries = compute_sfa_chunk_geometries(qsl, seq_lens, num_reqs=1, num_actual_tokens=10000, chunk_size=4096)
         views = build_sfa_attn_metadata_chunk_views(metadata, geometries)
         # chunk 0: 4096 new tokens + 3000 context; chunk 2: the last 1816
         assert views[0].seq_lens.tolist() == [7096]
@@ -196,9 +190,7 @@ class TestSfaAttnMetadataChunkViews:
     def test_shared_fields_unchanged(self):
         qsl, seq_lens = _make_batch([9000], [0])
         metadata = _make_attn_metadata(qsl, seq_lens)
-        geometries = compute_sfa_chunk_geometries(
-            qsl, seq_lens, num_reqs=1, num_actual_tokens=9000, chunk_size=4096
-        )
+        geometries = compute_sfa_chunk_geometries(qsl, seq_lens, num_reqs=1, num_actual_tokens=9000, chunk_size=4096)
         views = build_sfa_attn_metadata_chunk_views(metadata, geometries)
         for view in views:
             assert view.block_table is metadata.block_table
@@ -209,9 +201,7 @@ class TestSfaIndexerMetadataChunkViews:
     def test_views_slice_and_rebase(self):
         qsl, seq_lens = _make_batch([12000, 8000], [5000, 200])
         metadata = _make_indexer_metadata(qsl, seq_lens)
-        geometries = compute_sfa_chunk_geometries(
-            qsl, seq_lens, num_reqs=2, num_actual_tokens=20000, chunk_size=8192
-        )
+        geometries = compute_sfa_chunk_geometries(qsl, seq_lens, num_reqs=2, num_actual_tokens=20000, chunk_size=8192)
         views = build_sfa_indexer_metadata_chunk_views(metadata, geometries)
         for geometry, view in zip(geometries, views, strict=True):
             c0, c1 = geometry.c0, geometry.c1

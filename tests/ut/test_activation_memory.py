@@ -5,7 +5,7 @@
 
 import ast
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -506,8 +506,10 @@ def test_moe_chunk_labels_preserve_chunk_identity_and_draft_phase():
 def test_precast_internal_router_fast_path_is_measured():
     source = Path(__file__).resolve().parents[2] / "vllm_ascend" / "ops" / "fused_moe" / "fused_moe.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_compute_router_logits")
-    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    names = {"_compute_router_logits", "_prepare_router_input", "_apply_router_linear"}
+    methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(methods) == len(names)
+    module = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
     allocator = StatefulAllocator()
     result = torch.ones(2, 4)
     linear = MagicMock(side_effect=lambda *args: (allocator.pulse(200), result)[1])
@@ -515,13 +517,16 @@ def test_precast_internal_router_fast_path_is_measured():
     exec(compile(module, str(source), "exec"), env)
     gate = MagicMock()
     gate.weight_fp32 = torch.ones(4, 3)
+    runner = SimpleNamespace(gate=gate)
+    for name in names:
+        setattr(runner, name, MethodType(env[name], runner))
     with (
         patch("vllm_ascend.activation_memory.torch.npu", allocator, create=True),
         patch("vllm_ascend.activation_memory.logger.warning"),
         activation_peak_profile_session(enabled=True, rank=0) as profiler,
         record_activation_peak("target_moe", "target.layer.4.moe", layer_idx=4),
     ):
-        actual = env["_compute_router_logits"](SimpleNamespace(gate=gate), torch.ones(2, 3), torch.ones(2, 3))
+        actual = runner._compute_router_logits(torch.ones(2, 3), torch.ones(2, 3))
     assert actual is result
     gate.assert_not_called()
     linear.assert_called_once()
@@ -698,23 +703,43 @@ def test_serving_peak_request_topk_ranks_by_absolute_peak():
 
     # Find the REQ_TOPK_ENTRY lines in emission order; peaks must be descending.
     entries = [
-        args[0]
+        args[0] % args[1:]
         for (args, _kwargs) in log.call_args_list
         if args and "[SERVING_MEMORY][REQ_TOPK_ENTRY]" in str(args[0])
     ]
     assert len(entries) == 2
     assert "MOE_COMBINE" in entries[0]
-    assert "ATTN_SFA" in entries[1]
+    # Inclusive model scopes are ranked too: the parent retains the 800-byte
+    # MoE peak, ahead of the earlier 500-byte attention scope.
+    assert "MODEL" in entries[1]
+    assert "target.forward" in entries[1]
+
+
+def test_serving_peak_request_topk_prefers_absolute_peak_over_growth():
+    def record(category, baseline, peak):
+        return SimpleNamespace(
+            category=category,
+            label=category,
+            layer_idx=1,
+            num_tokens=64,
+            baseline_bytes=baseline,
+            peak_bytes=peak,
+            peak_growth_bytes=peak - baseline,
+        )
+
+    result = SimpleNamespace(
+        overall_peak_bytes=1000,
+        records=[record("attn_sfa", 900, 1000), record("moe_combine", 100, 800)],
+    )
+    with patch("vllm_ascend.activation_memory.logger.warning") as log:
+        log_serving_peak_request_topk(rank=0, topk=2, finished_req_ids={"req-1"}, run_result=result)
+    entries = [args for args, _ in log.call_args_list if "REQ_TOPK_ENTRY" in args[0]]
+    assert [args[7] for args in entries] == ["ATTN_SFA", "MOE_COMBINE"]
 
 
 def test_serving_peak_request_topk_noop_when_disabled():
     """topk<=0 or missing run_result is a silent no-op."""
     with patch("vllm_ascend.activation_memory.logger.warning") as log:
-        log_serving_peak_request_topk(
-            rank=0, topk=0, finished_req_ids={"req-1"}, run_result=None
-        )
-        log_serving_peak_request_topk(
-            rank=0, topk=5, finished_req_ids={"req-1"}, run_result=None
-        )
+        log_serving_peak_request_topk(rank=0, topk=0, finished_req_ids={"req-1"}, run_result=None)
+        log_serving_peak_request_topk(rank=0, topk=5, finished_req_ids={"req-1"}, run_result=None)
     log.assert_not_called()
-

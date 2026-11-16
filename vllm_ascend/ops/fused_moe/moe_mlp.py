@@ -18,11 +18,11 @@
 import torch
 import torch_npu
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+from vllm_ascend.activation_memory import record_activation_substage
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-
-from vllm_ascend.activation_memory import record_activation_substage
 
 
 def apply_moe_mlp(

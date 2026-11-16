@@ -14,6 +14,10 @@ from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionImplBase, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from vllm_ascend.activation_memory import log_activation_skip, profile_activation, record_activation_substage
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.attention.dsa_attn_kv_plan import (
@@ -24,6 +28,13 @@ from vllm_ascend.attention.dsa_chunking import (
     DSAChunkMeta,
     DSAChunkPlan,
     compute_dsa_chunk_geometries,
+)
+from vllm_ascend.attention.dsa_v1 import (
+    _dsa_layout_kv,
+    _dsa_swa_only_cmp_ratio,
+    _has_weight_scale,
+    build_dspark_swa_indices,
+    get_dspark_sparse_sas_window,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -57,17 +68,6 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     DeviceMetadataTask,
     wait_for_device_metadata,
-)
-
-from vllm_ascend.activation_memory import log_activation_skip, profile_activation, record_activation_substage
-from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention import dsa_v1
-from vllm_ascend.attention.dsa_v1 import (
-    _dsa_layout_kv,
-    _dsa_swa_only_cmp_ratio,
-    _has_weight_scale,
-    build_dspark_swa_indices,
-    get_dspark_sparse_sas_window,
 )
 
 if TYPE_CHECKING:

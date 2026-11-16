@@ -82,15 +82,21 @@ class TestComputeDSAChunkGeometries:
         num_actual = total if num_actual is None else num_actual
         num_pad = ((total + self.TP - 1) // self.TP) * self.TP
         tokens_per_rank = num_pad // self.TP
-        return compute_dsa_chunk_geometries(
+        return (
+            compute_dsa_chunk_geometries(
+                qsl,
+                seq_lens,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_actual,
+                local_start=0,
+                local_end=tokens_per_rank,
+                chunk_size=chunk_size or self.CHUNK,
+            ),
             qsl,
             seq_lens,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_actual,
-            local_start=0,
-            local_end=tokens_per_rank,
-            chunk_size=chunk_size or self.CHUNK,
-        ), qsl, seq_lens, total, tokens_per_rank
+            total,
+            tokens_per_rank,
+        )
 
     def test_single_request_spans_all_chunks(self):
         # One 12k-token request, 4k context: chunk views must partition it.
@@ -98,9 +104,7 @@ class TestComputeDSAChunkGeometries:
         assert [g.c0 for g in geos] == [0, 4096, 8192]
         assert [g.c1 for g in geos] == [4096, 8192, 12000]
         for g in geos:
-            ref_cu, ref_q, ref_seq, ref_start = _reference_chunk_view(
-                qsl.tolist(), seq_lens.tolist(), g.c0, g.c1
-            )
+            ref_cu, ref_q, ref_seq, ref_start = _reference_chunk_view(qsl.tolist(), seq_lens.tolist(), g.c0, g.c1)
             assert g.qsl_k.tolist() == ref_cu
             assert g.seq_lens_k.tolist() == ref_seq
             assert g.start_pos_k.tolist() == ref_start
@@ -117,9 +121,7 @@ class TestComputeDSAChunkGeometries:
         ctx = [100, 0, 777, 12345]
         geos, qsl, seq_lens, _, _ = self._geometries(req_lens, ctx)
         for g in geos:
-            ref_cu, ref_q, ref_seq, ref_start = _reference_chunk_view(
-                qsl.tolist(), seq_lens.tolist(), g.c0, g.c1
-            )
+            ref_cu, ref_q, ref_seq, ref_start = _reference_chunk_view(qsl.tolist(), seq_lens.tolist(), g.c0, g.c1)
             assert g.qsl_k.tolist() == ref_cu, (g.c0, g.c1)
             assert g.seq_lens_k.tolist() == ref_seq, (g.c0, g.c1)
             assert g.start_pos_k.tolist() == ref_start, (g.c0, g.c1)
@@ -127,8 +129,8 @@ class TestComputeDSAChunkGeometries:
         counts = [0] * len(req_lens)
         for g in geos:
             lens = (g.qsl_k[1:] - g.qsl_k[:-1]).tolist()
-            for i, l in enumerate(lens):
-                counts[i] += l
+            for i, length in enumerate(lens):
+                counts[i] += length
         assert counts == req_lens
 
     def test_zero_length_and_future_requests_zeroed(self):
@@ -177,7 +179,7 @@ class TestComputeDSAChunkGeometries:
             # Local seq lens never exceed the global chunk seq lens.
             glob = g.seq_lens_k.tolist()
             loc = g.seq_lens_local_k.tolist()
-            assert all(l <= max(glob[i], 0) for i, l in enumerate(loc))
+            assert all(length <= max(glob[i], 0) for i, length in enumerate(loc))
 
     def test_conventions_hold_for_every_chunk(self):
         req_lens = [1, 8191, 4097, 3, 22000]
@@ -204,8 +206,7 @@ class TestComputeDSAChunkGeometries:
             assert g.num_compressed_tokens_k == min(chunk_tokens, chunk_tokens // 4 + len(req_lens))
             # qli rows derive from local seq lens.
             assert torch.equal(
-                torch.div(g.seq_lens_local_k, 4, rounding_mode="floor") * 4
-                + torch.remainder(g.seq_lens_local_k, 4),
+                torch.div(g.seq_lens_local_k, 4, rounding_mode="floor") * 4 + torch.remainder(g.seq_lens_local_k, 4),
                 g.seq_lens_local_k,
             )
 
@@ -229,17 +230,33 @@ class TestComputeDSAChunkGeometries:
         qsl, seq_lens = _make_batch([10], [5])
         with pytest.raises(ValueError):
             compute_dsa_chunk_geometries(
-                qsl, seq_lens, num_reqs=1, num_actual_tokens=10, local_start=0, local_end=10,
-                chunk_size=4, compressor_ratio=128,
+                qsl,
+                seq_lens,
+                num_reqs=1,
+                num_actual_tokens=10,
+                local_start=0,
+                local_end=10,
+                chunk_size=4,
+                compressor_ratio=128,
             )
         with pytest.raises(ValueError):
             compute_dsa_chunk_geometries(
-                qsl, seq_lens, num_reqs=0, num_actual_tokens=10, local_start=0, local_end=10,
+                qsl,
+                seq_lens,
+                num_reqs=0,
+                num_actual_tokens=10,
+                local_start=0,
+                local_end=10,
                 chunk_size=4,
             )
         # qsl must end at num_actual_tokens.
         with pytest.raises(ValueError):
             compute_dsa_chunk_geometries(
-                qsl, seq_lens, num_reqs=1, num_actual_tokens=9, local_start=0, local_end=10,
+                qsl,
+                seq_lens,
+                num_reqs=1,
+                num_actual_tokens=9,
+                local_start=0,
+                local_end=10,
                 chunk_size=4,
             )

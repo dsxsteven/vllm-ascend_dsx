@@ -18,6 +18,13 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    profile_activation,
+    record_activation_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import (
@@ -60,15 +67,9 @@ from vllm_ascend.worker.device_metadata import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
-from vllm_ascend.activation_memory import (
-    is_activation_peak_profiling,
-    profile_activation,
-    record_activation_substage,
-)
-from vllm_ascend.ascend_config import get_ascend_config
-
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms
 
 if HAS_TRITON:

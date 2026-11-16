@@ -127,9 +127,7 @@ def _intersect_token_range(
     tokens_after = qsl[1:] - query_end
     valid = (query_lens > 0) & (sl > 0)
     seq_lens_k = torch.where(valid, (sl - tokens_after).clamp_min(0), torch.zeros_like(sl))
-    qsl_k = torch.cat(
-        [torch.zeros(1, dtype=torch.int32), torch.cumsum(query_lens, dim=0).to(torch.int32)]
-    )
+    qsl_k = torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(query_lens, dim=0).to(torch.int32)])
     return qsl_k, query_lens, seq_lens_k
 
 
@@ -191,9 +189,7 @@ def compute_dsa_chunk_geometries(
 
     geometries: list[DSAChunkGeometry] = []
     for index, (c0, c1) in enumerate(fixed_token_chunk_ranges(num_actual_tokens, chunk_size)):
-        qsl_k, query_lens_k, seq_lens_k = _intersect_token_range(
-            query_start_loc_cpu, seq_lens_cpu, c0, c1, num_reqs
-        )
+        qsl_k, query_lens_k, seq_lens_k = _intersect_token_range(query_start_loc_cpu, seq_lens_cpu, c0, c1, num_reqs)
         start_pos_k = _chunk_start_pos(query_start_loc_cpu, seq_lens_cpu, c0, num_reqs, query_lens_k)
         # Clamp both endpoints into the rank slice before subtracting so
         # chunks entirely outside the slice yield an empty (equal) local

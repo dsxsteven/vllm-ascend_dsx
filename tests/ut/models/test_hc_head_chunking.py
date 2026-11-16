@@ -53,15 +53,18 @@ class TestHcHeadChunking:
         eps = 1e-6
         return x, hc_fn, hc_scale, hc_base, eps, hc_norm
 
-    @pytest.mark.parametrize("N,chunk", [
-        (1, 4096),
-        (100, 4096),
-        (4097, 4096),
-        (8192, 4096),
-        (22000, 4096),
-        (22000, 1024),
-        (22000, 512),
-    ])
+    @pytest.mark.parametrize(
+        "N,chunk",
+        [
+            (1, 4096),
+            (100, 4096),
+            (4097, 4096),
+            (8192, 4096),
+            (22000, 4096),
+            (22000, 1024),
+            (22000, 512),
+        ],
+    )
     def test_chunking_matches_reference(self, N, chunk):
         x, hc_fn, hc_scale, hc_base, eps, hc_norm = self._make(N)
         ref = _reference_hc_head(x, hc_fn, hc_scale, hc_base, eps, hc_norm)

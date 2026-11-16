@@ -31,14 +31,10 @@ def _bf16_hc_head(x, hc_fn, hc_scale, hc_base, eps, chunk):
         xc = x[start:end]
         xc_shape = xc.size()
         xc_flat = xc.flatten(1)
-        inv_norm = torch.rsqrt(
-            xc_flat.float().square().mean(-1, keepdim=True) + 1e-6
-        )
+        inv_norm = torch.rsqrt(xc_flat.float().square().mean(-1, keepdim=True) + 1e-6)
         mixes = torch.nn.functional.linear(xc_flat * inv_norm.to(dtype), hc_fn_cast)
         pre = torch.sigmoid(mixes.float() * hc_scale + hc_base) + eps
-        y[start:end] = torch.sum(
-            pre.to(dtype).unsqueeze(-1) * xc_flat.view(xc_shape), dim=1
-        )
+        y[start:end] = torch.sum(pre.to(dtype).unsqueeze(-1) * xc_flat.view(xc_shape), dim=1)
     return y
 
 
@@ -52,10 +48,19 @@ class TestHcHeadBf16:
         hc_base = torch.randn(hc_mult, dtype=torch.float32) * 0.1
         return x, hc_fn, hc_scale, hc_base, 1e-6
 
-    @pytest.mark.parametrize("N,chunk", [
-        (1, 4096), (100, 4096), (2750, 4096), (2750, 1024),
-        (4096, 4096), (4097, 4096), (8192, 4096), (22000, 4096),
-    ])
+    @pytest.mark.parametrize(
+        "N,chunk",
+        [
+            (1, 4096),
+            (100, 4096),
+            (2750, 4096),
+            (2750, 1024),
+            (4096, 4096),
+            (4097, 4096),
+            (8192, 4096),
+            (22000, 4096),
+        ],
+    )
     def test_bf16_matches_reference(self, N, chunk):
         """bf16 output must be close to fp32 reference within bf16 tolerance.
 

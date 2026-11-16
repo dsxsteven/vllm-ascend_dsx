@@ -8,8 +8,7 @@ before running the compressor, indexer and sparse-attention operators without
 moving cache or scheduler knowledge back into the model.
 """
 
-from contextlib import contextmanager
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -29,7 +28,12 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
-from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_substage
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    log_activation_skip,
+    profile_activation,
+    record_activation_substage,
+)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.core.kv_cache_interface import (
@@ -50,14 +54,6 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTask,
     wait_for_device_metadata,
 )
-
-from vllm_ascend.activation_memory import (
-    is_activation_peak_profiling,
-    log_activation_skip,
-    profile_activation,
-    record_activation_substage,
-)
-from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 
 V41_METADATA_BUFFER_SIZE = 1024
 
@@ -717,10 +713,13 @@ class AscendDSAV41Impl:
         num_tokens_for_scope = metadata.swa.num_actual_tokens
         with (
             record_activation_substage(
-                "attn_qkv_proj", f"{scope_label}.attn.prepare_inputs_and_caches",
+                "attn_qkv_proj",
+                f"{scope_label}.attn.prepare_inputs_and_caches",
                 layer_idx=layer_idx,
                 num_tokens=num_tokens_for_scope,
-            ) if profiling else nullcontext()
+            )
+            if profiling
+            else nullcontext()
         ):
             q, qr, prepared_indexer = self._prepare_inputs_and_caches(
                 attn, hidden_states, metadata, forward_context.attn_metadata
@@ -731,20 +730,26 @@ class AscendDSAV41Impl:
             cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
             with (
                 record_activation_substage(
-                    "attn_indexer", f"{scope_label}.attn.indexer",
+                    "attn_indexer",
+                    f"{scope_label}.attn.indexer",
                     layer_idx=layer_idx,
                     num_tokens=num_tokens_for_scope,
-                ) if profiling else nullcontext()
+                )
+                if profiling
+                else nullcontext()
             ):
                 compressed_indices = self._select_sparse_indices(
                     attn, hidden_states, qr, positions, cos, sin, metadata, prepared_indexer
                 )
             with (
                 record_activation_substage(
-                    "attn_sfa", f"{scope_label}.attn.sfa",
+                    "attn_sfa",
+                    f"{scope_label}.attn.sfa",
                     layer_idx=layer_idx,
                     num_tokens=num_tokens_for_scope,
-                ) if profiling else nullcontext()
+                )
+                if profiling
+                else nullcontext()
             ):
                 attention_output = self._forward_attention(attn, q, metadata, compressed_indices)
                 AscendDSAV41Impl._apply_rotary(attn, attention_output, cos, sin, inverse=True)
@@ -753,10 +758,13 @@ class AscendDSAV41Impl:
             attention_output = hidden_states.new_empty((0, heads, attn.head_dim))
         with (
             record_activation_substage(
-                "attn_o_proj", f"{scope_label}.attn.o_proj",
+                "attn_o_proj",
+                f"{scope_label}.attn.o_proj",
                 layer_idx=layer_idx,
                 num_tokens=num_tokens_for_scope,
-            ) if profiling else nullcontext()
+            )
+            if profiling
+            else nullcontext()
         ):
             self._project_output(attn, attention_output, hidden_states, metadata, projected=output)
         return output

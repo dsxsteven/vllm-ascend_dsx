@@ -12,6 +12,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
     MoEWeights,
     slice_fused_experts_input_along_tokens,
 )
+from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.dataclass.router_input import MoeRouterInput
@@ -23,7 +24,6 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     MC2CommImpl,
     MoECommMethod,
 )
-from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAll2AllV, TokenDispatcherWithMC2
 from vllm_ascend.quantization.methods.base import QuantType
 
@@ -31,6 +31,7 @@ from vllm_ascend.quantization.methods.base import QuantType
 class TestMoECommMethod(TestBase):
     def setUp(self):
         from vllm_ascend.ops.fused_moe.moe_comm_method import _chunk_count_cache
+
         _chunk_count_cache.clear()
         self.mock_ascend_config = MagicMock()
         self.mock_ascend_config.ascend_fusion_config.fusion_ops_gmmswigluquant = False
@@ -318,6 +319,7 @@ class TestMoECommMethod(TestBase):
             [0, 0, 2],
             [0, 0, 1],
         ] * 2
+
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
@@ -551,7 +553,6 @@ class TestMoECommMethod(TestBase):
             combine_metadata=mock_td_instance.token_dispatch.return_value.combine_metadata,
         )
 
-
     def test_slice_fused_experts_input_along_tokens(self):
         hidden_states = torch.arange(72, dtype=torch.float32).reshape(9, 8)
         topk_ids = torch.arange(18, dtype=torch.int32).reshape(9, 2)
@@ -604,7 +605,6 @@ class TestMoECommMethod(TestBase):
             quant=MoEQuantParams(),
         )
 
-
     def _make_fused_mc2_impl(self, *, ep_world_size: int = 2) -> FusedMC2CommImpl:
         # Construct the implementation without running its NPU-only __init__.
         comm_impl = object.__new__(FusedMC2CommImpl)
@@ -618,7 +618,6 @@ class TestMoECommMethod(TestBase):
         token_dispatcher.moe_all_to_all_group_name = "mock_mc2_group"
         comm_impl.token_dispatcher = token_dispatcher
         return comm_impl
-
 
     def test_fused_mc2_chunk_max_output_size_tracks_chunk_capacity(self):
         self.mock_ascend_config.enable_fused_mc2 = 1
@@ -661,9 +660,7 @@ class TestMoECommMethod(TestBase):
             return comm_impl.expert_token_nums
 
         comm_impl._apply_dispatch_ffn_combine = fake_apply
-        result = comm_impl._fused_experts_chunked(
-            fused_input, num_chunks=3, weights=fused_input.weights
-        )
+        result = comm_impl._fused_experts_chunked(fused_input, num_chunks=3, weights=fused_input.weights)
 
         assert seen_sizes == [3, 3, 3]
         assert seen_max_output_sizes == [16, 16, 16]
@@ -680,7 +677,9 @@ class TestMoECommMethod(TestBase):
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAll2AllV")
-    def test_alltoall_fused_experts_e2e_chunking(self, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context):
+    def test_alltoall_fused_experts_e2e_chunking(
+        self, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context
+    ):
         mock_context = MagicMock()
         mock_context.moe_comm_method = "alltoall"
         mock_get_forward_context.return_value = mock_context
@@ -793,7 +792,6 @@ class TestMoECommMethod(TestBase):
         assert result == "base_result"
         mock_base.assert_called_once()
         mock_e2e.assert_not_called()
-
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")

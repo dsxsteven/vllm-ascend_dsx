@@ -23,9 +23,19 @@ import torch
 from vllm.distributed import get_dp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    log_ffn_chunk_decision,
+    log_mtp_moe_chunk_detail,
+    profile_activation,
+    record_moe_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.ops.fused_moe import moe_utils
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
     MoEFusedExpertsInput,
     MoEWeights,
@@ -39,6 +49,7 @@ from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
 )
+from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
@@ -52,17 +63,6 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
-
-from vllm_ascend.activation_memory import (
-    is_activation_peak_profiling,
-    log_ffn_chunk_decision,
-    log_mtp_moe_chunk_detail,
-    profile_activation,
-    record_moe_substage,
-)
-from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
-from vllm_ascend.ops.fused_moe import moe_utils
-from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 
 _MoECommMethods: dict[tuple[MoECommType | None, tuple[int, ...]], MoECommMethod] = {}
 

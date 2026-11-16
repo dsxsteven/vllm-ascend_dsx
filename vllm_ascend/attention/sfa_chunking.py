@@ -152,9 +152,7 @@ def build_sfa_attn_metadata_chunk_views(
     views = []
     for geometry in geometries:
         c0, c1 = geometry.c0, geometry.c1
-        qsl_k, seq_lens_k = _rebased_device_tensors(
-            geometry, attn_metadata.cum_query_lens, attn_metadata.seq_lens
-        )
+        qsl_k, seq_lens_k = _rebased_device_tensors(geometry, attn_metadata.cum_query_lens, attn_metadata.seq_lens)
         cos = None if attn_metadata.cos is None else attn_metadata.cos[c0:c1]
         sin = None if attn_metadata.sin is None else attn_metadata.sin[c0:c1]
         views.append(

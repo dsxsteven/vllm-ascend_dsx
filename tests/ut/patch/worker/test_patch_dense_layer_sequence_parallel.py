@@ -236,7 +236,8 @@ def test_embedding_keeps_unpatched_moe_first_layer_full(load_patch):
 
 @pytest.mark.parametrize("dense,embedding", [(None, None), (False, False), (False, True), (True, False), (True, True)])
 @pytest.mark.parametrize("sharded", [False, True])
-def test_final_norm_order_and_values_follow_dense_flag(load_patch, dense, embedding, sharded):
+@pytest.mark.parametrize("last_rank", [False, True])
+def test_final_norm_order_and_values_follow_dense_flag(load_patch, dense, embedding, sharded, last_rank):
     state = load_patch(dense, embedding)
     trace = []
     tokens, hidden_size = 3, 4
@@ -266,7 +267,10 @@ def test_final_norm_order_and_values_follow_dense_flag(load_patch, dense, embedd
         "islice": islice,
         "envs": state.envs,
         "IntermediateTensors": dict,
-        "get_pp_group": lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        "get_pp_group": lambda: SimpleNamespace(is_first_rank=True, is_last_rank=last_rank),
+        "pp_transport": SimpleNamespace(
+            add_pp_transport_tensors=Mock(), PPTransportDataType=SimpleNamespace(AUX_HIDDEN_STATES="aux")
+        ),
         "tensor_model_parallel_all_gather": gather,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(_WORKER / "patch_deepseek_v2.py"), "exec"), namespace)
@@ -278,9 +282,20 @@ def test_final_norm_order_and_values_follow_dense_flag(load_patch, dense, embedd
         end_layer=1,
         layers=[lambda *args: (hidden, residual)],
         aux_hidden_state_layers=(),
+        _use_upstream_aux_relay=False,
+        send_pp_topk_indices=False,
         norm=normalize,
     )
     actual = namespace["_patched_forward"](model, torch.arange(tokens), torch.arange(tokens), None)
+    if not last_rank:
+        assert trace == ([("gather", (rows, 2 * hidden_size))] if sharded else [])
+        expected_hidden = torch.cat([hidden, hidden])[:tokens] if sharded else hidden
+        expected_residual = torch.cat([residual, residual])[:tokens] if sharded else residual
+        torch.testing.assert_close(actual["hidden_states"], expected_hidden)
+        torch.testing.assert_close(actual["residual"], expected_residual)
+        assert actual["residual"].is_contiguous()
+        namespace["pp_transport"].add_pp_transport_tensors.assert_called_once()
+        return
     if sharded:
         if dense:
             assert trace == [("norm", (rows, hidden_size)), ("gather", (rows, hidden_size))]

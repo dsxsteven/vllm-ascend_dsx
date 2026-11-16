@@ -22,6 +22,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend.activation_memory import record_activation_substage
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -71,7 +72,6 @@ from vllm_ascend.quantization.methods import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
 from vllm_ascend.quantization.methods.kv_cache.turboquant.latent import TurboQuantLatent
-from vllm_ascend.activation_memory import record_activation_substage
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
     ACL_FORMAT_FRACTAL_NZ,
@@ -1348,13 +1348,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 
-
     def _dump_exec_kv_inputs(self, tag, kv_no_split, cos, sin, slots, kv_cache):
         """Debug-only input dump for npu_kv_rmsnorm_rope_cache (env-gated).
 
         Syncs two .item() reads; only for diagnosing tiling failures.
         """
-        import os, sys
+        import os
+        import sys
+
         if not os.getenv("SFA_CHUNK_DUMP"):
             return
         print(
@@ -1364,8 +1365,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             f"sin={tuple(sin.shape)}/{sin.dtype} contig={sin.is_contiguous()} "
             f"slots={tuple(slots.shape)}/{slots.dtype} min={slots.min().item()} max={slots.max().item()} "
             f"gamma={tuple(self.kv_a_layernorm.weight.shape)}/{self.kv_a_layernorm.weight.dtype} "
-            f"cache0={tuple(kv_cache[0].shape)}/{kv_cache[0].dtype} cache1={tuple(kv_cache[1].shape)}/{kv_cache[1].dtype}",
-            file=sys.stderr, flush=True,
+            f"cache0={tuple(kv_cache[0].shape)}/{kv_cache[0].dtype} "
+            f"cache1={tuple(kv_cache[1].shape)}/{kv_cache[1].dtype}",
+            file=sys.stderr,
+            flush=True,
         )
 
     def exec_kv(
@@ -2080,11 +2083,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         # (every preprocess flavor incl. NATIVE; MLAPO additionally caps the
         # per-chunk token count at its fused-kernel limit).
         chunk_plan = getattr(attn_metadata, "chunks", None)
-        if chunk_plan is not None:
+        # This plan addresses the full token stream. The sequence-parallel
+        # entry point gathers token shards and scales the output in its own
+        # finalize path, which the replicated-stream chunk loop cannot replace.
+        if chunk_plan is not None and not input_is_sequence_parallel:
             if self.runtime_has_indexer and getattr(indexer_attn_metadata, "chunks", None) is None:
                 logger.warning_once(
-                    "SFA attention chunking skipped: the indexer metadata carries no chunk "
-                    "plan (layer_name=%s).",
+                    "SFA attention chunking skipped: the indexer metadata carries no chunk plan (layer_name=%s).",
                     layer_name,
                 )
             elif self.preprocess_type == PreprocessType.MLAPO and chunk_plan.chunk_size > MLAPO_MAX_SUPPORTED_TOKENS:
@@ -2417,15 +2422,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     q_c = self.q_a_layernorm(q_c)
                     cos_k, sin_k = chunk_md.cos, chunk_md.sin
                     chunk_slots = self._get_sfa_kv_slot_mapping(chunk_md)
-                    self._dump_exec_kv_inputs(
-                        f"chunk[{c0}:{c1}]", kv_no_split, cos_k, sin_k, chunk_slots, kv_cache
-                    )
+                    self._dump_exec_kv_inputs(f"chunk[{c0}:{c1}]", kv_no_split, cos_k, sin_k, chunk_slots, kv_cache)
                     kv_outputs = self.exec_kv(kv_no_split, cos_k, sin_k, kv_cache, chunk_slots, chunk_md)
                     k_pe, k_nope = kv_outputs[:2]
                     knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
-                    fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
-                        k_pe, k_nope, knope_scale, False
-                    )
+                    fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(k_pe, k_nope, knope_scale, False)
                     ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
                     if self.qk_rope_head_dim:
                         q_pe = self.rope_single(q_pe, cos_k, sin_k)
@@ -2465,8 +2466,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
 
             # ── sparse attention for the chunk's rows ──
-            with attention_transfer_window(), record_activation_substage(
-                "attn_sfa", f"{layer_name}.attn.sfa", num_tokens=chunk_tokens
+            with (
+                attention_transfer_window(),
+                record_activation_substage("attn_sfa", f"{layer_name}.attn.sfa", num_tokens=chunk_tokens),
             ):
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope,

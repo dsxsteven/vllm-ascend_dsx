@@ -4,6 +4,9 @@
 import pytest
 import torch
 
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
+from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
 from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
     balanced_chunk_ranges,
     chunk_group_list,
@@ -11,9 +14,6 @@ from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
 )
-from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
-from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
-from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
 
 
 @pytest.mark.parametrize(

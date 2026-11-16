@@ -153,10 +153,8 @@ def test_model_releases_residual_before_next_layer_and_tail(use_sp, with_aux, fi
         hc_mult=4,
         embed_input_ids=lambda _: embeddings,
         aux_hidden_state_layers=[1, 3] if with_aux else [],
-        _needs_mtp_hidden_states=needs_mtp,
-        _mtp_hidden_buffer=None,
-        _mtp_buffer_shape=(6, 16),
-        _mtp_buffer_dtype=torch.float32,
+        # Upstream allocates the graph-stable buffer during initialization.
+        _mtp_hidden_buffer=torch.empty((6, 16)) if needs_mtp and last else None,
         device="cpu",
         hc_head_fn=None,
         hc_head_scale=None,
@@ -172,11 +170,13 @@ def test_model_releases_residual_before_next_layer_and_tail(use_sp, with_aux, fi
         if index + 1 in model.aux_hidden_state_layers:
             expected_aux.append(expected_hidden.mean(dim=1))
 
+    mtp_buffer = model._mtp_hidden_buffer
     # A second call covers reusing the MTP buffer and both embedding inputs.
     for use_embeds in (False, True):
         with torch.inference_mode():
             result = forward(model, input_ids, positions, intermediate, embeddings if first and use_embeds else None)
         assert_released()
+        assert model._mtp_hidden_buffer is mtp_buffer
         if last:
             output, auxiliary = result if expected_aux else (result, [])
             torch.testing.assert_close(output, expected_hidden.mean(dim=1) + 5, rtol=0, atol=0)

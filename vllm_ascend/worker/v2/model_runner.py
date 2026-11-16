@@ -50,6 +50,17 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+from vllm_ascend.activation_memory import (
+    ActivationPeakProfiler,
+    activation_peak_profile_session,
+    log_serving_peak_request_topk,
+    profile_runner_phase,
+    record_activation_buffer,
+    record_activation_peak,
+    serving_memory_log_step,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
     get_mc2_tokens_capacity,
@@ -128,18 +139,6 @@ from vllm_ascend.worker.v2.utils import (
     prepare_v41_source_rope,
     torch_cuda_wrapper,
 )
-
-from vllm_ascend.activation_memory import (
-    ActivationPeakProfiler,
-    activation_peak_profile_session,
-    log_serving_peak_request_topk,
-    profile_runner_phase,
-    record_activation_buffer,
-    record_activation_peak,
-    serving_memory_log_step,
-)
-from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
 
 
 class NPUModelRunner(GPUModelRunner):

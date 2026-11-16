@@ -198,7 +198,5 @@ def run_moe_ffn_in_token_chunks(
     # cannot observe the base after we return — matches token_combine's
     # contract that only ``output`` is live going forward.
     if output is not hidden_states:
-        mlp_compute_input.hidden_states.set_(
-            torch.empty((0,), device=hidden_states.device, dtype=hidden_states.dtype)
-        )
+        mlp_compute_input.hidden_states.set_(torch.empty((0,), device=hidden_states.device, dtype=hidden_states.dtype))
     return output, before_gmm2_event

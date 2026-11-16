@@ -77,6 +77,14 @@ from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    profile_activation,
+    record_activation_peak,
+    record_activation_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -105,14 +113,6 @@ from vllm_ascend.worker.v2.pp_transport import (
 from vllm_ascend.worker.v2.pp_transport import (
     make_empty_intermediate_tensors as make_pp_empty_intermediate_tensors,
 )
-
-from vllm_ascend.activation_memory import (
-    is_activation_peak_profiling,
-    profile_activation,
-    record_activation_peak,
-    record_activation_substage,
-)
-from vllm_ascend.ascend_config import get_ascend_config
 
 sequence_parallel_chunk = sp_shard
 

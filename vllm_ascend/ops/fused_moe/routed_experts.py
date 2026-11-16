@@ -29,6 +29,9 @@ from vllm.model_executor.layers.fused_moe import FusedMoERouter, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 from vllm.model_executor.utils import replace_parameter
+
+from vllm_ascend.activation_memory import profile_activation, record_activation_substage
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -38,17 +41,14 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.force_eplb import get_force_eplb_topk
-from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
-from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
-
-from vllm_ascend.activation_memory import profile_activation, record_activation_substage
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     FusedExpertsResult,
     get_moe_comm_method,
 )
+from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
+from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):

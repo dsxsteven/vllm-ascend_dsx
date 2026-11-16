@@ -6,8 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-import vllm_ascend.attention.sfa_v1 as sparse_mla
 from vllm.config.compilation import CUDAGraphMode
+
+import vllm_ascend.attention.sfa_v1 as sparse_mla
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADSACPImpl
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, PreprocessType
 

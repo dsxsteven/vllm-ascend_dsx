@@ -28,6 +28,13 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from vllm_ascend.activation_memory import (
+    is_activation_peak_profiling,
+    log_activation_skip,
+    record_activation_substage,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -88,13 +95,6 @@ from vllm_ascend.utils import (
     weak_ref_tensors,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
-
-from vllm_ascend.activation_memory import (
-    is_activation_peak_profiling,
-    log_activation_skip,
-    record_activation_substage,
-)
-from vllm_ascend.ascend_config import get_ascend_config
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -3514,9 +3514,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
         with (
             record_activation_substage(
-                "attn_qkv_proj", f"{scope_label}.attn.qkv_proj",
+                "attn_qkv_proj",
+                f"{scope_label}.attn.qkv_proj",
                 num_tokens=num_actual_tokens,
-            ) if profiling else nullcontext()
+            )
+            if profiling
+            else nullcontext()
         ):
             if use_prolog_v3_strided_cache:
                 decode_preprocess_res, prefill_preprocess_res = self.mla_preprocess_prolog_v3(
@@ -3547,9 +3550,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
         with (
             record_activation_substage(
-                "attn_sfa", f"{scope_label}.attn.sfa",
+                "attn_sfa",
+                f"{scope_label}.attn.sfa",
                 num_tokens=num_actual_tokens,
-            ) if profiling else nullcontext()
+            )
+            if profiling
+            else nullcontext()
         ):
             if decode_preprocess_res is not None:
                 # MLA Preprocess for decoding

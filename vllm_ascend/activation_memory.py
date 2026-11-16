@@ -688,8 +688,7 @@ def log_serving_peak_request_topk(
         return
     req_ids_str = ",".join(sorted(str(r) for r in finished_req_ids))
     logger.warning(
-        "[SERVING_MEMORY][REQ_TOPK] rank=%s finished_req_ids=%s topk=%s "
-        "run_peak=%.3f GiB ranked_scopes=%s",
+        "[SERVING_MEMORY][REQ_TOPK] rank=%s finished_req_ids=%s topk=%s run_peak=%.3f GiB ranked_scopes=%s",
         rank,
         req_ids_str or "-",
         len(top),

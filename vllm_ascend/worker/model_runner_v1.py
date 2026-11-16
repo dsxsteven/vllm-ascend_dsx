@@ -118,6 +118,18 @@ from vllm.v1.worker.utils import (
     prepare_kernel_block_sizes,
     raise_if_nan_logits,
 )
+
+# yapf: enable
+from vllm_ascend.activation_memory import (
+    ActivationPeakProfiler,
+    activation_peak_profile_session,
+    log_serving_peak_request_topk,
+    profile_runner_phase,
+    record_activation_buffer,
+    record_activation_peak,
+    serving_memory_log_step,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
@@ -125,7 +137,10 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_views_for_spec,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
     MLA_FLASH_SUPPORTED_Q_HEADS,
     AscendCommonAttentionMetadata,
@@ -243,21 +258,6 @@ from vllm_ascend.worker.utils import (
 )
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
-# yapf: enable
-from vllm_ascend.activation_memory import (
-    ActivationPeakProfiler,
-    activation_peak_profile_session,
-    log_serving_peak_request_topk,
-    profile_runner_phase,
-    record_activation_buffer,
-    record_activation_peak,
-    serving_memory_log_step,
-)
-from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
-from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
-
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
     get_mc2_tokens_capacity,
@@ -269,6 +269,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 )
 
 from vllm.model_executor.models.interfaces import supports_multimodal_pruning
+
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 
 if TYPE_CHECKING:
@@ -279,6 +280,11 @@ else:
 
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+
+from vllm_ascend.attention.dsa_v41 import (
+    AscendDSAV41MetadataBuilder,
+    DeepseekV41CacheLayer,
+)
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
@@ -292,11 +298,6 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
-)
-
-from vllm_ascend.attention.dsa_v41 import (
-    AscendDSAV41MetadataBuilder,
-    DeepseekV41CacheLayer,
 )
 
 v41_metadata_builder_type: type[AscendDSAV41MetadataBuilder] = AscendDSAV41MetadataBuilder
@@ -6592,6 +6593,7 @@ def _torch_cuda_wrapper():
 @contextmanager
 def _replace_gpu_model_runner_function_wrapper(target_module_name):
     import vllm.v1.worker.encoder_cudagraph as _vllm_encoder_cudagraph
+
     from vllm_ascend.worker.encoder_acl_graph import EncoderAclGraphManager
 
     _encoder_mgr_orig = _vllm_encoder_cudagraph.EncoderCudaGraphManager

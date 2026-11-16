@@ -687,9 +687,7 @@ class TestAscendConfig(TestBase):
             ({"attention_chunk_size": -8192}, "must be positive"),
         ]:
             test_vllm_config.additional_config = {**additional_config, "refresh": True}
-            with self.subTest(additional_config=additional_config), self.assertRaisesRegex(
-                ValueError, error_pattern
-            ):
+            with self.subTest(additional_config=additional_config), self.assertRaisesRegex(ValueError, error_pattern):
                 init_ascend_config(test_vllm_config)
             clear_ascend_config()
 

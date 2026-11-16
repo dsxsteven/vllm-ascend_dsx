@@ -20,9 +20,9 @@ from __future__ import annotations
 import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm_ascend.ops.linear import AscendReplicatedLinear
 
 from vllm_ascend.activation_memory import profile_activation
+from vllm_ascend.ops.linear import AscendReplicatedLinear
 
 
 class AscendGateLinear(GateLinear):
