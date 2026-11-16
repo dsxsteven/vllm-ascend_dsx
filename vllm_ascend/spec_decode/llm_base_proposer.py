@@ -120,13 +120,13 @@ def _supports_spec_decode_graph(model_config, method: str) -> bool:
     """Return whether graph-mode drafting is supported for this model/method.
 
     GLM graph-mode support is currently validated only for the GLM-MoE-DSA
-    in-model MTP drafter. Keep other GLM variants and speculative methods on
-    the existing eager path.
+    MTP and DSpark drafters. Keep other GLM variants and speculative methods
+    on the existing eager path.
     """
     if not _is_glm_model(model_config):
         return True
     model_type = getattr(getattr(model_config, "hf_text_config", None), "model_type", "")
-    return str(model_type).lower() == "glm_moe_dsa" and method == "mtp"
+    return str(model_type).lower() == "glm_moe_dsa" and method in ("mtp", "dspark")
 
 
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
@@ -212,13 +212,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.use_cuda_graph and not _supports_spec_decode_graph(self.vllm_config.model_config, self.method):
             logger.warning(
                 "GLM graph-mode speculative decoding is currently supported "
-                "only for the MTP method. The %s draft model has been "
+                "only for the MTP and DSpark methods. The %s draft model has been "
                 "automatically switched to eager mode.",
                 self.method,
             )
             self.use_cuda_graph = False
         elif self.use_cuda_graph and is_glm_model:
-            logger.info("Enabling ACL graph mode for the GLM-MoE-DSA MTP draft model.")
+            logger.info("Enabling ACL graph mode for the GLM-MoE-DSA %s draft model.", self.method)
 
         self._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
 
@@ -1111,8 +1111,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.method == "dspark":
             assert draft_token_ids.ndim == 2
             assert draft_token_ids.shape[0] >= batch_size, (
-                f"DSpark graph returned {draft_token_ids.shape[0]} request rows "
-                f"for a real batch of {batch_size}."
+                f"DSpark graph returned {draft_token_ids.shape[0]} request rows for a real batch of {batch_size}."
             )
             assert draft_token_ids.shape[1] == self.num_speculative_tokens
         return draft_token_ids
@@ -2123,8 +2122,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             first_layer = self.draft_attn_groups[0].layer_names[0]
             graph_key = draft_attn_metadatas[0][first_layer].actual_seq_lengths_q[-1]
             assert graph_key == num_tokens, (
-                f"DSpark graph update key {graph_key} does not match "
-                f"captured query size {num_tokens}."
+                f"DSpark graph update key {graph_key} does not match captured query size {num_tokens}."
             )
         attn_backend = self.draft_attn_groups[0].backend
         update_full_graph_params(
