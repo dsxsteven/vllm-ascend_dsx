@@ -588,10 +588,15 @@ class AscendConfig:
     attention run per token chunk to cap attention activation memory).
     The sparse compute path requires compression ratio 4. DSA-CP sequence
     parallel BF16 output projection can also tile other ratios. Both require
-    eager mode. See ``attention_chunk_size``."""
+    eager mode. MRV2 PCP also supports text DeepSeek V4 causal prefill:
+    canonical cache writes and rank-local queries are tiled independently,
+    while PCP collectives and output projection remain outside the loops.
+    Decode, V4.1 and multimodal PCP retain their existing execution paths.
+    See ``attention_chunk_size``."""
     attention_chunk_size: int = 8192
-    """Global token chunk size for attention chunking when
-    ``enable_attention_chunking`` is set. Must be positive."""
+    """Global token chunk size for legacy attention chunking. For MRV2 PCP,
+    bounds both canonical cache-update rows and each rank's query rows.
+    Used when ``enable_attention_chunking`` is set. Must be positive."""
     activation_peak_debug: bool = False
     """Enable scoped activation-memory peak logging during profile_run.
     Covers the full forward (embedding/hc-expand/layer/attention/MoE/
@@ -1019,7 +1024,16 @@ class AscendConfig:
         if self.enable_attention_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
             raise ValueError("enable_attention_chunking currently requires eager mode; set enforce_eager=true.")
         if self.enable_attention_chunking:
-            if not self.enable_dsa_cp:
+            pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
+            if pcp_size > 1:
+                if getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) > 1:
+                    raise ValueError("PCP attention chunking currently requires decode_context_parallel_size=1.")
+                logger.info_once(
+                    "[attention] PCP chunking covers text DeepSeek V4 causal prefill cache updates and local "
+                    "queries; decode, V4.1 and multimodal PCP keep the original path. "
+                    "Actual multi-chunk execution is reported separately."
+                )
+            elif not self.enable_dsa_cp:
                 logger.warning_once(
                     "enable_attention_chunking only takes effect on the DSA-CP attention "
                     "path (enable_dsa_cp=true, compress ratio 4) or the SFA attention "

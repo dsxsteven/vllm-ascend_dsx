@@ -111,6 +111,31 @@ vllm-ascend有主干分支和开发分支。
 
 ## 贡献
 
+### PCP Attention chunk（本分支实验功能）
+
+通过 `--additional-config` 设置 `enable_attention_chunking=true` 和
+`attention_chunk_size=2048`，可对 DeepSeek V4 文本因果 prefill 的 PCP 路径分块。
+要求 eager 模式、PCP 大于 1、DCP 为 1。可以同时启用
+`enable_ffn_chunking=true`、`ffn_chunk_size=2048`。
+
+该实现先按标准 PCP 顺序 gather/restore hidden states，分块更新全局 SWA、
+compressor 和 indexer cache，再按每个 rank 的局部请求布局分块计算 query。
+每块保留请求的绝对位置和独立 metadata；O projection 及原 PCP 通信位于分块循环外。
+`attention_chunk_size` 同时限制全局 cache 更新和局部 query 的块大小。
+Decode、DeepSeek V4.1、多模态路径仍使用原实现；不支持 PCP 与 DCP 同时大于 1
+的 Attention chunk 配置。已完成 CPU 检查、真实 NPU 算子分块对比和 PCP8 eager
+启动及请求验证。24 条边界/长输入用例的输出 token、结束原因与未启用 Attention
+chunk 的基线一致，logprob 差异在预设容差内；单 token 输入在两组中均有重复波动，
+完整严格正确性门禁尚未通过。上述验证不覆盖 graph、DCP > 1 或多模态场景。
+
+只有实际 token 数超过阈值才会生成多个 chunk。验证 PCP8 的局部 query 分块时，
+应使用超过 16384 tokens 的 prefill，并提供足够大的 `--max-num-batched-tokens`。
+日志中的 `PCP global cache chunking applied` 和 `PCP local query chunking applied`
+记录实际执行的分块路径；短请求拉起成功或配置开关为 true 均不足以证明多块执行。
+CPU 检查位于 `tests/ut/test_dsa_pcp_chunking_cpu.py`；已就绪服务的固定 token
+请求与比较工具位于 `tests/e2e/pcp_attention_chunk_validation.py`，运行 `--help`
+查看参数。它仅验证 HTTP、重复稳定性和输出差异，需同时核对所有 rank 的实际分块证据。
+
 请参考[CONTRIBUTING](https://docs.vllm.ai/projects/ascend/en/latest/developer_guide/contribution/index.html)文档了解更多关于开发环境搭建、功能测试以及 PR 提交规范的信息。
 
 我们欢迎并重视任何形式的贡献与合作：

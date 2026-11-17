@@ -29,6 +29,11 @@ from vllm_ascend.attention.dsa_chunking import (
     DSAChunkPlan,
     compute_dsa_chunk_geometries,
 )
+from vllm_ascend.attention.dsa_pcp_chunking import (
+    DSAPCPChunk,
+    compute_pcp_chunk_geometries,
+    slice_pcp_chunk_common_metadata,
+)
 from vllm_ascend.attention.dsa_v1 import (
     _dsa_layout_kv,
     _dsa_swa_only_cmp_ratio,
@@ -2622,6 +2627,8 @@ class AscendDSAPCPMetadata(dsa_v1.AscendDSAMetadata):
     hidden_restore_idx: torch.Tensor
     global_dsa_metadata: dsa_v1.AscendDSAMetadata
     pcp_has_global_prefill: bool = False
+    pcp_global_chunks: tuple[DSAPCPChunk, ...] = ()
+    pcp_local_chunks: tuple[DSAPCPChunk, ...] = ()
 
     @classmethod
     def from_local_metadata(
@@ -2631,6 +2638,8 @@ class AscendDSAPCPMetadata(dsa_v1.AscendDSAMetadata):
         hidden_restore_idx: torch.Tensor,
         global_dsa_metadata: dsa_v1.AscendDSAMetadata,
         pcp_has_global_prefill: bool = False,
+        pcp_global_chunks: tuple[DSAPCPChunk, ...] = (),
+        pcp_local_chunks: tuple[DSAPCPChunk, ...] = (),
     ) -> "AscendDSAPCPMetadata":
         return cls(
             num_actual_tokens=local_metadata.num_actual_tokens,
@@ -2646,7 +2655,14 @@ class AscendDSAPCPMetadata(dsa_v1.AscendDSAMetadata):
             hidden_restore_idx=hidden_restore_idx,
             global_dsa_metadata=global_dsa_metadata,
             pcp_has_global_prefill=pcp_has_global_prefill,
+            pcp_global_chunks=pcp_global_chunks,
+            pcp_local_chunks=pcp_local_chunks,
         )
+
+
+class _DSAPCPChunkMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+    # Local PCP rows include both halves of a DualChunkSwap request.
+    _request_capacity_factor: ClassVar[int] = 2
 
 
 class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
@@ -2684,6 +2700,54 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             device=device,
         )
         self._global_rope_buffers: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        ascend_config = get_ascend_config()
+        self._pcp_attention_chunk_size = (
+            ascend_config.attention_chunk_size if ascend_config.enable_attention_chunking is True else 0
+        )
+        self._pcp_global_chunk_builders: list[_DSAPCPChunkMetadataBuilder] = []
+        self._pcp_local_chunk_builders: list[_DSAPCPChunkMetadataBuilder] = []
+
+    def _build_pcp_chunks(
+        self,
+        common: AscendCommonAttentionMetadata,
+        builders: list[_DSAPCPChunkMetadataBuilder],
+        *,
+        cache_scope: str = "global",
+    ) -> tuple[DSAPCPChunk, ...]:
+        if common.num_actual_tokens <= self._pcp_attention_chunk_size:
+            return ()
+        geometries = compute_pcp_chunk_geometries(
+            common.query_start_loc_cpu[: common.num_reqs + 1],
+            common.num_actual_tokens,
+            self._pcp_attention_chunk_size,
+        )
+        chunks = []
+        for index, geometry in enumerate(geometries):
+            if index == len(builders):
+                builder = _DSAPCPChunkMetadataBuilder(
+                    self.kv_cache_spec, self.layer_names, self.vllm_config, self.device
+                )
+                # A one-token tail of a prefill chunk still uses the prefill
+                # SAS/QLI layout. Each builder owns distinct metadata buffers;
+                # later chunks must not overwrite earlier chunks' views.
+                builder.decode_threshold = 0
+                # Compressor metadata is memoized on the forward context by
+                # cache group. A chunk has different positions and output rows
+                # from both the full batch and its siblings.
+                builder.cache_group_key = f"{builder.cache_group_key}:pcp:{cache_scope}:{index}"
+                builders.append(builder)
+            chunk_common = slice_pcp_chunk_common_metadata(common, geometry)
+            metadata = builders[index].build(
+                0,
+                chunk_common,
+                False,
+                num_actual_reqs=chunk_common.num_reqs,
+                common_ratio_to_sas_metadata={},
+                can_use_rope_cache=False,
+                full_graph_mode=False,
+            )
+            chunks.append(DSAPCPChunk(geometry.start, geometry.end, metadata))
+        return tuple(chunks)
 
     @classmethod
     def get_cudagraph_support(
@@ -2974,12 +3038,29 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         if not needs_global_metadata:
             return local_dsa_metadata
 
+        global_chunks = local_chunks = ()
+        if (
+            getattr(self, "_pcp_attention_chunk_size", 0) > 0
+            and has_prefill
+            and not full_graph_mode
+            and common_attn_metadata.causal
+            and self.model_config.hf_config.model_type == "deepseek_v4"
+            and not getattr(self.model_config.hf_config, "vision_n_layers", 0)
+            and not getattr(common_attn_metadata, "mm_req_doc_ranges", None)
+        ):
+            global_chunks = self._build_pcp_chunks(global_common_attn_metadata, self._pcp_global_chunk_builders)
+            local_chunks = self._build_pcp_chunks(
+                local_common_attn_metadata, self._pcp_local_chunk_builders, cache_scope="local"
+            )
+
         return AscendDSAPCPMetadata.from_local_metadata(
             local_dsa_metadata,
             local_common_attn_metadata.num_input_tokens,
             pcp_context.hidden_restore_idx,
             global_dsa_metadata,
             pcp_has_global_prefill=has_prefill,
+            pcp_global_chunks=global_chunks,
+            pcp_local_chunks=local_chunks,
         )
 
     def enable_device_metadata(self) -> None:
@@ -3382,10 +3463,44 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
             pcp_metadata,
         )
 
-        global_dsa_metadata_by_prefix = {}
-        for cache_prefix, metadata in attn_metadata.items():
-            assert isinstance(metadata, AscendDSAPCPMetadata)
-            global_dsa_metadata_by_prefix[cache_prefix] = metadata.global_dsa_metadata
+        if pcp_metadata.pcp_global_chunks:
+            logger.info_once(
+                "[attention] PCP global cache chunking applied: chunks=%s, max_tokens=%s.",
+                len(pcp_metadata.pcp_global_chunks),
+                max(chunk.end - chunk.start for chunk in pcp_metadata.pcp_global_chunks),
+            )
+            for index, chunk in enumerate(pcp_metadata.pcp_global_chunks):
+                chunk_metadata = {}
+                for prefix, metadata in attn_metadata.items():
+                    assert isinstance(metadata, AscendDSAPCPMetadata)
+                    group_chunk = metadata.pcp_global_chunks[index]
+                    assert (group_chunk.start, group_chunk.end) == (chunk.start, chunk.end)
+                    chunk_metadata[prefix] = group_chunk.metadata
+                with record_activation_substage("attn_pcp_global_chunk", num_tokens=chunk.end - chunk.start):
+                    self._update_global_layer_caches(
+                        layer_name,
+                        global_hidden_states[chunk.start : chunk.end],
+                        kv_cache,
+                        chunk_metadata,
+                    )
+        else:
+            global_dsa_metadata_by_prefix = {}
+            for cache_prefix, metadata in attn_metadata.items():
+                assert isinstance(metadata, AscendDSAPCPMetadata)
+                global_dsa_metadata_by_prefix[cache_prefix] = metadata.global_dsa_metadata
+            self._update_global_layer_caches(layer_name, global_hidden_states, kv_cache, global_dsa_metadata_by_prefix)
+        # Keep collective count and order identical on all ranks, including
+        # empty local query ranks. No collective is added to either chunk loop.
+        self._maybe_all_gather_pcp_o_proj_weights()
+        return True
+
+    def _update_global_layer_caches(
+        self,
+        layer_name: str,
+        global_hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        global_dsa_metadata_by_prefix: dsa_v1.DSAMetadataDict,
+    ) -> None:
         global_layer_metadata = self._get_layer_metadata(
             layer_name,
             global_dsa_metadata_by_prefix,
@@ -3419,11 +3534,65 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
                     kv_cache,
                     indexer_metadata,
                 )
-        # Every rank must join the weight gathers, including ranks that return
-        # before local attention. Launch after the cache collectives to overlap
-        # local attention on nonempty ranks.
-        self._maybe_all_gather_pcp_o_proj_weights()
-        return True
+
+    def _forward_attention(
+        self,
+        layer_name: str,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        layer_metadata: dsa_v1.AscendDSALayerMetadata,
+        cache_is_prepared: bool = False,
+    ) -> torch.Tensor:
+        common = layer_metadata.attention if layer_metadata.attention is not None else layer_metadata.swa
+        chunks = common.pcp_local_chunks if isinstance(common, AscendDSAPCPMetadata) else ()
+        if not chunks:
+            return super()._forward_attention(layer_name, hidden_states, kv_cache, layer_metadata, cache_is_prepared)
+        if not cache_is_prepared:
+            raise RuntimeError("PCP attention chunks require the canonical KV caches to be prepared first")
+        logger.info_once(
+            "[attention] PCP local query chunking applied: chunks=%s, max_tokens=%s.",
+            len(chunks),
+            max(chunk.end - chunk.start for chunk in chunks),
+        )
+        result = None
+        for index, chunk in enumerate(chunks):
+
+            def select(metadata, chunk_index=index, expected_range=(chunk.start, chunk.end)):
+                if metadata is None:
+                    return None
+                group_chunk = metadata.pcp_local_chunks[chunk_index]
+                assert (group_chunk.start, group_chunk.end) == expected_range
+                return group_chunk.metadata
+
+            def compressor(metadata):
+                return (
+                    AscendCompressorMetadata(cache=select(metadata.cache), state=select(metadata.state))
+                    if metadata is not None
+                    else None
+                )
+
+            chunk_layer_metadata = dsa_v1.AscendDSALayerMetadata(
+                attention=select(layer_metadata.attention),
+                swa=select(layer_metadata.swa),
+                compressor=compressor(layer_metadata.compressor),
+                indexer=AscendIndexerMetadata(compressor=compressor(layer_metadata.indexer.compressor))
+                if layer_metadata.indexer is not None
+                else None,
+            )
+            with record_activation_substage("attn_pcp_local_chunk", num_tokens=chunk.end - chunk.start):
+                chunk_result = super()._forward_attention(
+                    layer_name,
+                    hidden_states[chunk.start : chunk.end],
+                    kv_cache,
+                    chunk_layer_metadata,
+                    True,
+                )
+                if result is None:
+                    result = chunk_result.new_empty((hidden_states.shape[0], *chunk_result.shape[1:]))
+                result[chunk.start : chunk.end].copy_(chunk_result)
+                del chunk_result
+        assert result is not None
+        return result
 
     def _get_o_proj_input_shape(
         self,
