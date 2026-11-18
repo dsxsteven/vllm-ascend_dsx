@@ -17,6 +17,7 @@ from vllm_ascend.device.hardware_profile import (
     MoECommPolicy,
     get_current_hardware_profile,
 )
+from vllm_ascend.mrv2_utils import get_pcp_profile_num_tokens
 from vllm_ascend.quantization.quant_type import A5_SUPPORT_MEGA_MOE_QUANT_TYPES, QuantType
 from vllm_ascend.utils import (
     has_layer_idx,
@@ -252,7 +253,9 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     # HCCL comm buffer (HCCL_BUFFSIZE); MegaMoe (use_mega_moe, non-decode-only)
     # uses the symm buffer (separate torch alloc, not HCCL_BUFFSIZE).
     if ascend_config.enable_prefill_mc2 or (use_mega_moe and not _is_decode_only_node(vllm_config)):
-        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        max_num_tokens = get_pcp_profile_num_tokens(
+            vllm_config, vllm_config.scheduler_config.max_num_batched_tokens, max_num_reqs
+        )
     elif vllm_config.compilation_config.cudagraph_capture_sizes:
         max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
     else:

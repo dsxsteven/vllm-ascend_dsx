@@ -101,6 +101,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     init_sparse_kv_offload_manager,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
+from vllm_ascend.mrv2_utils import get_pcp_profile_num_tokens
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
     is_c8_mxfp_kv_quant,
@@ -882,10 +883,12 @@ class NPUModelRunner(GPUModelRunner):
             if sparse_cfg.enabled:
                 allocate_kv_offload_topk_profile_buffers(self.get_kv_cache_spec(), self.vllm_config, sparse_cfg)
             mc2_tokens_capacity = get_mc2_tokens_capacity()
+            global_tokens = self.max_num_tokens
+            profile_tokens = get_pcp_profile_num_tokens(self.vllm_config, global_tokens, self.max_num_reqs)
             with override_mrv2_in_profile_run(True):
                 if (
                     mc2_tokens_capacity is not None
-                    and self.max_num_tokens > mc2_tokens_capacity
+                    and profile_tokens > mc2_tokens_capacity
                     and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
                     in {MoECommType.MC2, MoECommType.FUSED_MC2}
                 ):
@@ -893,7 +896,11 @@ class NPUModelRunner(GPUModelRunner):
                     # runner-specific ForwardContext plumbing.
                     with disable_compilation(self.get_model()):
                         self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
-                super().profile_run()
+                self.max_num_tokens = profile_tokens
+                try:
+                    super().profile_run()
+                finally:
+                    self.max_num_tokens = global_tokens
         self.activation_peak_profile_result = profiler
 
     @torch.inference_mode()
