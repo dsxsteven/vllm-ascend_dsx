@@ -70,6 +70,8 @@ class TestMoECommMethod(TestBase):
     def _make_fused_mc2_comm_for_buffer_init(self):
         comm_impl = object.__new__(FusedMC2CommImpl)
         comm_impl.moe_config = self.moe_config
+        comm_impl.enable_ffn_chunking = False
+        comm_impl.ffn_chunk_size = 4
         comm_impl.moe_config.hidden_dim = 16
         comm_impl.moe_config.intermediate_size_per_partition = 32
         comm_impl.token_dispatcher = object.__new__(TokenDispatcherWithMC2)
@@ -150,6 +152,8 @@ class TestMoECommMethod(TestBase):
 
         comm_impl = object.__new__(FusedMC2CommImpl)
         comm_impl.swiglu_limit = 7.0
+        comm_impl.enable_ffn_chunking = False
+        comm_impl.ffn_chunk_size = 4
         comm_impl.swiglu_alpha = 1.702
         comm_impl.swiglu_beta = 1.0
         comm_impl.mega_moe = mega_moe
@@ -673,6 +677,125 @@ class TestMoECommMethod(TestBase):
         self.mock_ascend_config.enable_fused_mc2 = 2
 
         assert comm_impl._fused_mc2_chunk_count(num_tokens=16) == 0
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_mc2_group")
+    def test_mega_moe_chunk_buffer_is_static_and_keeps_uneven_capacity(self, _):
+        comm = self._make_fused_mc2_comm_for_buffer_init()
+        comm.enable_ffn_chunking = True
+        comm._init_mega_moe_symm_buffer(is_decode_only_node=False)
+        args, kwargs = comm.get_symm_buffer_for_mega_moe.call_args
+        assert args[2] == 4
+        assert kwargs["max_recv_token_num"] == 4 * 8  # One local expert/rank.
+        comm.token_dispatcher.global_bs = 128 * 8
+        comm._init_mega_moe_symm_buffer(is_decode_only_node=False)
+        args, kwargs = comm.get_symm_buffer_for_mega_moe.call_args
+        assert args[2] == 128
+        assert kwargs["max_recv_token_num"] == 128 * 8
+        comm.token_dispatcher.global_bs = 0
+        comm.enable_ffn_chunking = False
+        comm._init_mega_moe_symm_buffer(is_decode_only_node=True)
+        assert comm.get_symm_buffer_for_mega_moe.call_args.args[2] == 128
+
+    def test_mega_moe_chunking_from_entry_preserves_rows_masks_weights_and_counts(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _EXTRA_CTX
+
+        comm = self._make_fused_mc2_impl()
+        comm.enable_fused_mc2 = 1
+        comm._log_chunk_decision = MagicMock()
+        self.mock_ascend_config.enable_fused_mc2 = 1
+        inp = self._make_e2e_fused_input(torch.arange(80, dtype=torch.float32).reshape(10, 8))
+        inp.routing.mc2_mask[7:] = False
+        inp.topk_ids[:, 0] = torch.arange(10)
+        quant_method = MagicMock()
+        weights = object()
+        quant_method.get_fused_mc2_weights.return_value = weights
+        seen = []
+        output_refs = []
+        counts = torch.zeros(2, dtype=torch.int64)
+
+        def apply(chunk, actual_weights, *, is_decode_only_node):
+            assert actual_weights is weights
+            assert is_decode_only_node is False
+            assert all(ref() is None for ref in output_refs)
+            seen.append((chunk.topk_ids.clone(), chunk.routing.mc2_mask.clone(), chunk.routing.pertoken_scale.clone()))
+            output = chunk.hidden_states * 2
+            output_refs.append(weakref.ref(output))
+            counts.copy_(torch.tensor([chunk.hidden_states.shape[0], chunk.routing.mc2_mask.sum()]))
+            return output, counts  # Reuse storage to catch count aliasing.
+
+        comm._apply_cann_mega_moe = apply
+        with patch.object(_EXTRA_CTX, "use_mega_moe", True), patch.object(_EXTRA_CTX, "is_decode_only_node", False):
+            result = comm.fused_experts(inp, quant_method)
+        assert [ids.shape[0] for ids, _, _ in seen] == [4, 3, 3]
+        torch.testing.assert_close(torch.cat([x[0] for x in seen]), inp.topk_ids)
+        torch.testing.assert_close(torch.cat([x[1] for x in seen]), inp.routing.mc2_mask)
+        torch.testing.assert_close(torch.cat([x[2] for x in seen]), inp.routing.pertoken_scale)
+        torch.testing.assert_close(result.routed_out, inp.hidden_states * 2)
+        assert result.expert_tokens.tolist() == [10, 7]
+        assert result.expert_tokens.data_ptr() != counts.data_ptr()
+        assert comm._log_chunk_decision.call_args.kwargs["path"] == "E2E_CANN_MEGA_MOE"
+
+    def test_mega_moe_disabled_small_and_empty_inputs_keep_single_call(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _EXTRA_CTX
+
+        for enabled, tokens in ((False, 9), (True, 4), (True, 1), (True, 0)):
+            with self.subTest(enabled=enabled, tokens=tokens):
+                comm = self._make_fused_mc2_impl()
+                comm.enable_fused_mc2 = 1
+                comm.enable_ffn_chunking = enabled
+                comm._log_chunk_decision = MagicMock()
+                self.mock_ascend_config.enable_fused_mc2 = 1
+                inp = self._make_e2e_fused_input(torch.ones(tokens, 8))
+                comm._apply_cann_mega_moe = MagicMock(return_value=(inp.hidden_states, torch.tensor([tokens])))
+                with (
+                    patch.object(_EXTRA_CTX, "use_mega_moe", True),
+                    patch.object(_EXTRA_CTX, "is_decode_only_node", True),
+                ):
+                    result = comm.fused_experts(inp)
+                comm._apply_cann_mega_moe.assert_called_once_with(inp, inp.weights, is_decode_only_node=True)
+                assert result.routed_out is inp.hidden_states
+
+    def test_mega_moe_chunk_capacity_guard_rejects_unsliced_uniform_input(self):
+        comm = self._make_fused_mc2_comm_for_buffer_init()
+        comm.enable_ffn_chunking = True
+        inp = self._make_e2e_fused_input(torch.ones(5, 8))
+        with self.assertRaisesRegex(ValueError, "at most 4"):
+            comm._apply_cann_mega_moe(inp, inp.weights, is_decode_only_node=False)
+
+    def test_mega_moe_uneven_dp_agrees_rounds_and_falls_back_for_idle_rank(self):
+        from vllm_ascend.ops.fused_moe.moe_comm_method import _EXTRA_CTX
+
+        self.mock_ascend_config.enable_fused_mc2 = 1
+        self.moe_config.dp_size = 2
+        for minimum, sizes in ((0, [9]), (1, [9]), (2, [5, 4]), (9, [3, 3, 3])):
+            with self.subTest(minimum=minimum):
+                comm = self._make_fused_mc2_impl()
+                comm.enable_fused_mc2 = 1
+                comm.token_dispatcher.global_bs = 40
+                comm._log_chunk_decision = MagicMock()
+                inp = self._make_e2e_fused_input(torch.ones(9, 8))
+                seen = []
+
+                def apply(chunk, weights, *, is_decode_only_node, _seen=seen):
+                    _seen.append(chunk.hidden_states.shape[0])
+                    return chunk.hidden_states * 2, torch.tensor([chunk.hidden_states.shape[0]])
+
+                comm._apply_cann_mega_moe = apply
+                dp = MagicMock(world_size=2)
+                with (
+                    patch.object(_EXTRA_CTX, "use_mega_moe", True),
+                    patch.object(_EXTRA_CTX, "is_decode_only_node", False),
+                    patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_dp_group", return_value=dp),
+                    patch(
+                        "torch.distributed.all_reduce",
+                        side_effect=lambda value, minimum=minimum, **kw: value.copy_(torch.tensor([3, -minimum])),
+                    ) as reduce,
+                ):
+                    result = comm.fused_experts(inp)
+                reduce.assert_called_once()
+                assert seen == sizes
+                torch.testing.assert_close(result.routed_out, inp.hidden_states * 2)
+                assert result.expert_tokens.tolist() == [9]
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")

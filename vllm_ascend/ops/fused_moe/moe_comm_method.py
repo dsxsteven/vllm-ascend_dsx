@@ -745,6 +745,13 @@ class FusedMC2CommImpl(MoECommMethod):
             # from scheduler/graph config — rank-invariant.
             rank_invariant_cap = getattr(self.token_dispatcher, "max_num_tokens_per_rank", 0)
             num_max_tokens_per_rank = max(1, int(rank_invariant_cap))
+        # MC2's uniform-token prepare path pads every DP rank to the same
+        # length before TP slicing. Chunking therefore bounds every operator
+        # call by ffn_chunk_size, including decode and shorter tails. Keep the
+        # full static capacity in uneven-token mode: collective-safe chunking
+        # may fall back or produce larger chunks when another rank is short.
+        if self.enable_ffn_chunking and self.token_dispatcher.global_bs == 0:
+            num_max_tokens_per_rank = min(num_max_tokens_per_rank, self.ffn_chunk_size)
         num_topk = self.moe_config.experts_per_token
         num_experts = self.moe_config.num_experts
         expert_per_rank = max(1, num_experts // int(self.token_dispatcher.ep_world_size))
@@ -798,6 +805,7 @@ class FusedMC2CommImpl(MoECommMethod):
             dispatch_quant_out_dtype=dispatch_quant_out_dtype,
         )
 
+    @profile_activation("moe_fused_mega_moe")
     def _apply_cann_mega_moe(
         self,
         fused_experts_input: MoEFusedExpertsInput,
@@ -809,6 +817,8 @@ class FusedMC2CommImpl(MoECommMethod):
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
         num_tokens = fused_experts_input.hidden_states.shape[0]
         num_max_tokens = self.token_dispatcher.max_num_tokens_per_rank
+        if self.enable_ffn_chunking and self.token_dispatcher.global_bs == 0:
+            num_max_tokens = min(num_max_tokens, self.ffn_chunk_size)
         if num_tokens > num_max_tokens:
             raise ValueError(
                 f"MegaMoe received {num_tokens} tokens per rank, but its symmetric buffer "
@@ -893,7 +903,7 @@ class FusedMC2CommImpl(MoECommMethod):
         return out, expert_tokens
 
     def _fused_mc2_chunk_count(self, num_tokens: int) -> int:
-        """Return a collective-safe chunk count for dispatch_ffn_combine."""
+        """Return a collective-safe chunk count for fused MC2 operators."""
         if not self.enable_ffn_chunking or get_ascend_config().enable_fused_mc2 != 1:
             return 0
         return _e2e_uniform_chunk_count(num_tokens, self.ffn_chunk_size, self.moe_config)
@@ -997,6 +1007,32 @@ class FusedMC2CommImpl(MoECommMethod):
             expert_tokens=expert_tokens,
         )
 
+    def _mega_moe_experts_chunked(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        num_chunks: int,
+        weights: MoEWeights,
+        *,
+        is_decode_only_node: bool,
+    ) -> FusedExpertsResult:
+        """Run CANN MegaMoE once per collective-aligned raw-token chunk."""
+        routed_out = torch.empty_like(fused_experts_input.hidden_states)
+        expert_tokens = None
+        for start, end in balanced_chunk_ranges(routed_out.shape[0], num_chunks):
+            chunk_input = slice_fused_experts_input_along_tokens(fused_experts_input, start, end)
+            chunk_out, chunk_expert_tokens = self._apply_cann_mega_moe(
+                chunk_input, weights, is_decode_only_node=is_decode_only_node
+            )
+            routed_out[start:end].copy_(chunk_out)
+            if expert_tokens is None:
+                expert_tokens = chunk_expert_tokens.clone()
+            else:
+                expert_tokens.add_(chunk_expert_tokens)
+            # MegaMoE returns fresh outputs rather than accepting an out view.
+            # Release them before the next collective allocates its outputs.
+            del chunk_out, chunk_expert_tokens, chunk_input
+        return FusedExpertsResult(routed_out=routed_out, expert_tokens=expert_tokens)
+
     def fused_experts(
         self,
         fused_experts_input: MoEFusedExpertsInput,
@@ -1016,6 +1052,21 @@ class FusedMC2CommImpl(MoECommMethod):
         expert_tokens = None
         if self.enable_fused_mc2 == 1:
             if _EXTRA_CTX.use_mega_moe:
+                raw_tokens = fused_experts_input.hidden_states.shape[0]
+                num_chunks = self._fused_mc2_chunk_count(raw_tokens)
+                self._log_chunk_decision(
+                    path="E2E_CANN_MEGA_MOE",
+                    raw_tokens=raw_tokens,
+                    dispatched_tokens=None,
+                    num_chunks=num_chunks,
+                )
+                if num_chunks > 0:
+                    return self._mega_moe_experts_chunked(
+                        fused_experts_input,
+                        num_chunks,
+                        weights,
+                        is_decode_only_node=_EXTRA_CTX.is_decode_only_node,
+                    )
                 out, expert_tokens = self._apply_cann_mega_moe(
                     fused_experts_input, weights, is_decode_only_node=_EXTRA_CTX.is_decode_only_node
                 )
