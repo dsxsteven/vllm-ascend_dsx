@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
+    get_pcp_group,
     get_tp_group,
 )
 from vllm.logger import logger
@@ -18,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
@@ -70,6 +74,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import BaseKVPoolWorker
 
+if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pcp_load import PcpLayerwiseLoad
+
+
 # PERF-TUNE switch: defer the last layer's save drain out of the forward
 # critical path; the drain runs at the start of the next step's start_load_kv.
 # Opt-in (default off): the synchronous inline drain is the long-standing
@@ -102,6 +110,26 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self._dspark_prefix_keys: DSparkPrefixKeys | None = None
         self.dspark_prefix_cache: DSparkPrefixCache | None = None
         self._init_layerwise_config()
+        self.pcp_load: PcpLayerwiseLoad | None = None
+        self.pcp_load_enabled = (
+            "kv_pool_pcp_h2d_allgather" in vllm_config.additional_config
+            and get_ascend_config().kv_pool_pcp_h2d_allgather
+            and self.pcp_size > 1
+        )
+        if self.pcp_load_enabled and not (
+            self.backend_name == "memcache"
+            and self.layerwise_offload
+            and self.use_mla
+            and self.dcp_size == 1
+            and self.pp_size == 1
+            and not self.use_mamba
+            and not self.use_kvpp
+            and not self.has_shared_kv
+        ):
+            raise ValueError(
+                "kv_pool_pcp_h2d_allgather requires memcache layerwise offload, "
+                "replicated MLA KV, DCP=1 and PP=1 (without Mamba/shared-source/KVPP)"
+            )
 
     def _init_kv_transfer_config(self, vllm_config, extra_config, use_layerwise, kv_cache_config) -> None:
         backend_name = extra_config.get("backend", "mooncake").lower()
@@ -469,6 +497,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     logger.error("AscendStore shutdown lease cleanup returned %s", result)
                 self._step_load_keys.clear()
         finally:
+            if getattr(self, "pcp_load", None) is not None:
+                self.pcp_load.close()
             self.m_store.close()
         self._closed = True
 
@@ -534,6 +564,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             )
             self.kv_send_thread.start()
             ready_event_sending.wait()
+        if getattr(self, "pcp_load_enabled", False):
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pcp_load import PcpLayerwiseLoad
+
+            self.pcp_load = PcpLayerwiseLoad(self.m_store, get_pcp_group())
         ready_event = threading.Event()
         self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
             self.m_store,
@@ -557,6 +591,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             invalid_block_ids=self._invalid_block_ids,
             invalid_block_ids_lock=self._invalid_block_ids_lock,
             load_abort_event=self._layer_load_aborted,
+            pcp_load=getattr(self, "pcp_load", None),
         )
         self.kv_recv_thread.save_disabled = self._save_disabled
         if self.kv_send_thread is not None:
@@ -674,7 +709,39 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self._save_disabled.clear()
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
+        pcp_load = getattr(self, "pcp_load", None)
+        if pcp_load is not None:
+            # Wait for the PCP save owner before resolving previous-step GVAs.
+            torch.distributed.barrier(group=pcp_load.control_group)
+        elif self.use_layerwise_transfer and self.layerwise_offload and getattr(self, "pcp_size", 1) > 1:
+            # Direct H2D readers also depend on the single PCP save owner.
+            get_pcp_group().barrier()
         self.process_layer_data(metadata.requests)
+        if pcp_load is not None:
+            self._validate_pcp_load_plan()
+
+    def _validate_pcp_load_plan(self) -> None:
+        assert self.pcp_load is not None
+        signature = hashlib.sha256()
+        shared_signatures: dict[int, bytes] = {}
+        for layer_id, tasks in enumerate(self.layer_load_tasks):
+            signature.update(json.dumps((layer_id, len(tasks))).encode())
+            for task in tasks:
+                shared = task.shared_block_data
+                if shared is None:
+                    raise RuntimeError("PCP load requires shared block metadata")
+                shared_id = id(shared)
+                if shared_id not in shared_signatures:
+                    selected = hashlib.sha256()
+                    selected.update(json.dumps((shared.req_ids, sorted(shared.load_keys))).encode())
+                    selected.update(shared.block_ids_arr.tobytes())
+                    if shared.block_gvas_arr is not None:
+                        selected.update((shared.block_gvas_arr > 0).tobytes())
+                    shared_signatures[shared_id] = selected.digest()
+                signature.update(shared_signatures[shared_id])
+                signature.update(json.dumps((task.group_id, task.layer_idx_in_group)).encode())
+        signature.update(json.dumps(self.group_block_len, sort_keys=True).encode())
+        self.pcp_load.validate_plan(signature.hexdigest())
 
     def _is_layerwise_save_leader(self) -> bool:
         """Exactly one rank per (pcp, dcp, head_or_tp) group saves/allocates.
@@ -1586,7 +1653,11 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             )
             return True
 
-        if getattr(self, "has_shared_kv", False):
+        if getattr(self, "pcp_load", None) is not None:
+            # KV and model collectives must have the same global order on every
+            # rank. Background prefetch can otherwise race attention or MC2.
+            window_end = self.current_layer
+        elif getattr(self, "has_shared_kv", False):
             assert self.hf_config is not None
             source_layers = self.hf_config.kv_source_layer_ids
             window_end = self.current_layer
@@ -1673,8 +1744,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 if layer_id not in self._recurrent_layers:
                     gate.on_start = lambda: self._submit_attention_save(layer_id)
                 gate.on_finish = self._finish_attention_window
-            if getattr(self, "block_key_hybrid", False) and self.next_layer_to_submit <= self.current_layer:
-                # An unprefetched demand load must not race earlier collectives.
+            if (
+                getattr(self, "block_key_hybrid", False) or getattr(self, "pcp_load", None) is not None
+            ) and self.next_layer_to_submit <= self.current_layer:
+                # Finish model communication before a demand-load collective.
                 boundary = torch.npu.Event()
                 boundary.record()
                 boundary.synchronize()

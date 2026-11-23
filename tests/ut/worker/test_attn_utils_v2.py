@@ -509,7 +509,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
     num_blocks = 2
     spec = AscendMLAAttentionSpec(
         block_size=384,
-        num_heads=64,
+        num_query_heads=64,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
@@ -587,7 +587,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
         )[layer_name]
 
     for q_heads in (8, 12, 64, 96):
-        spec = replace(spec, num_heads=q_heads)
+        spec = replace(spec, num_query_heads=q_heads)
         fused = reshape()
         assert isinstance(fused, torch.Tensor)
         assert fused.shape == (6, 128, 1, 576)
@@ -595,7 +595,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
 
     # The resolved backend rejects unsupported query-head counts before cache
     # allocation, so FIA receives the component-major view even on A5.
-    spec = replace(spec, num_heads=48)
+    spec = replace(spec, num_query_heads=48)
     attn_module.impl.use_flashmla = False
     a5_fallback = reshape()
     assert isinstance(a5_fallback, tuple)
@@ -604,7 +604,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
     # FIA-compatible component-major layout.
     # Backend selection has already resolved missing operator APIs to FIA.
     attn_module.impl.use_flashmla = False
-    spec = replace(spec, num_heads=64)
+    spec = replace(spec, num_query_heads=64)
     missing_flashmla_ops = reshape()
     assert isinstance(missing_flashmla_ops, tuple)
 
@@ -1257,7 +1257,8 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(
     spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.0.self_attn.attn"]
 
     assert isinstance(spec, AscendMLAAttentionSpec)
-    assert spec.num_heads == expected_num_heads
+    assert spec.num_query_heads == expected_num_heads
+    assert spec.num_heads == spec.num_kv_heads
     assert spec.dcp_sharded is dcp_sharded
     assert spec.page_size_bytes == source_spec.page_size_bytes
     assert spec.is_draft is (source_is_draft or is_draft_layer)
@@ -2247,7 +2248,7 @@ def _make_mla_layer(*, fa_quant: bool = False, sparse_c8: bool = False):
     layer.get_kv_cache_spec = lambda _cfg: AscendMLAAttentionSpec(
         block_size=16,
         # The owner publishes the complete Ascend cache contract.
-        num_heads=64,
+        num_query_heads=64,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.bfloat16,
@@ -2651,8 +2652,10 @@ def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
     specs = attn_utils.get_kv_cache_spec(vllm_config)
     assert set(specs) == {"fa", "sfa"}
     assert specs["fa"].head_size == 128
-    assert specs["fa"].num_heads == 64
-    assert specs["sfa"].num_heads == 64
+    assert specs["fa"].num_query_heads == 64
+    assert specs["fa"].num_heads == 1
+    assert specs["sfa"].num_query_heads == 64
+    assert specs["sfa"].num_heads == 1
     assert specs["sfa"].cache_sparse_sfa_c8 is True
 
     mla_spec = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)

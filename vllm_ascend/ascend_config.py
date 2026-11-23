@@ -700,6 +700,7 @@ class AscendConfig:
     enable_kv_nz: bool = False
     kv_trace: KVTraceConfig = dataclasses.field(default_factory=KVTraceConfig)
     kv_pool_range_debug: bool = False
+    kv_pool_pcp_h2d_allgather: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False

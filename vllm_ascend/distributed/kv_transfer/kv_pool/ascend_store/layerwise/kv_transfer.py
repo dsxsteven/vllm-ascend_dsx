@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -30,6 +30,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata
     SharedBlockData,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ChunkedTokenDatabase, ReqMeta
+
+if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pcp_load import PcpLayerwiseLoad
+
 
 _KVPOOL_RANGE_DEBUG_PREFIX = "[KVPOOL_RANGE_DEBUG]"
 
@@ -857,6 +861,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         invalid_block_ids: set[int] | None = None,
         invalid_block_ids_lock: threading.Lock | None = None,
         load_abort_event: threading.Event | None = None,
+        pcp_load: PcpLayerwiseLoad | None = None,
     ):
         super().__init__(
             m_store,
@@ -880,6 +885,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self._load_abort_event = load_abort_event or threading.Event()
+        self.pcp_load = pcp_load
         self._active_load_indices: set[int] | None = None
         self._group_load_indices: dict[int, set[int] | None] = {}
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
@@ -1046,6 +1052,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.layer_load_finished_events[data.layer_id].set()
             self.request_queue.task_done()
 
+    def _copy_pcp_shard(self, gvas: np.ndarray, addrs: np.ndarray, sizes: np.ndarray) -> int:
+        return self._batch_copy_with_limits(gvas, addrs, sizes, 1, self.max_transfer_blocks, self.max_transfer_bytes)
+
     def _copy_gva_layers(self, data: LayerLoadTask) -> bool:
         # Layerwise threads only run when the worker-side
         # protocol gate is on; every store call below sits on the Backend ABC.
@@ -1116,14 +1125,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
         if self.external_slot_release_waiter is not None:
             self.external_slot_release_waiter(layer_id)
-        res = self._batch_copy_with_limits(
-            gvas_array,
-            addr_array,
-            size_array,
-            1,
-            self.max_transfer_blocks,
-            self.max_transfer_bytes,
-        )
+        pcp_load = getattr(self, "pcp_load", None)
+        if pcp_load is not None:
+            pcp_load.copy(gvas_array, addr_array, size_array, self._copy_pcp_shard)
+            res = 0
+        else:
+            res = self._batch_copy_with_limits(
+                gvas_array,
+                addr_array,
+                size_array,
+                1,
+                self.max_transfer_blocks,
+                self.max_transfer_bytes,
+            )
         if layer_id <= 2 or res != 0:
             logger.debug(
                 "load_thread: layer=%d groups=%d blocks=%d res=%d",

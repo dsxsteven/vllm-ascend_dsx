@@ -7,9 +7,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.config import KVTransferConfig
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.cache_planner import (
     LayerwiseCachePlanner,
     get_layerwise_offload_config,
@@ -282,3 +289,67 @@ def test_invalid_native_view_is_rejected(changes, message):
     config.kv_cache_tensors[-1] = replace(config.kv_cache_tensors[-1], **changes)
     with pytest.raises(ValueError, match=message):
         _plan(config, _runtime(3, 1), {FullAttentionSpec: True})
+
+
+@pytest.mark.parametrize("num_blocks", [1, 3])
+@pytest.mark.parametrize("unified_group", [False, True])
+@pytest.mark.parametrize("indexer_quantized", [False, True])
+def test_glm_sfa_reuse_preserves_main_and_indexer_regions(num_blocks, unified_group, indexer_quantized):
+    num_layers = 7
+    main = AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16)
+    indexer = AscendSFAIndexerCacheSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.int8 if indexer_quantized else torch.bfloat16,
+        scale_dim=1 if indexer_quantized else 0,
+        scale_dtype=torch.float16,
+        cache_sparse_li_c8=indexer_quantized,
+    )
+    main_names = [f"model.layers.{i}.self_attn.attn" for i in range(num_layers)]
+    indexer_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(num_layers)]
+    specs = dict.fromkeys(main_names, main) | dict.fromkeys(indexer_names, indexer)
+    groups = (
+        [KVCacheGroupSpec(list(specs), UniformTypeKVCacheSpecs.from_specs(specs))]
+        if unified_group
+        else [KVCacheGroupSpec(main_names, main), KVCacheGroupSpec(indexer_names, indexer)]
+    )
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_groups=groups,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * spec.page_size_bytes, layers=[name], layer_stride=0, block_stride=spec.page_size_bytes
+            )
+            for name, spec in specs.items()
+        ],
+    )
+    runtime = _runtime(num_layers, 3, "glm_moe_dsa")
+    layout = plan_layerwise_cache_reuse(config, runtime)
+    assert layout is not None
+    assert layout.independent_layers == [0]
+    assert layout.prefetch_layer_map == {4: (1,), 5: (2,), 6: (3,)}
+    assert layout.reused_cache_names == set(main_names[1:] + indexer_names[1:])
+    worker_config = apply_layerwise_kv_cache_plan(config, runtime.kv_transfer_config, layout)
+    allocated = []
+
+    def allocate(size):
+        allocated.append(size)
+        return torch.zeros(size, dtype=torch.uint8)
+
+    tensors = allocate_cache_backing(worker_config, specs, allocate, layout.cache_view_sizes)
+    assert allocated == [4 * num_blocks * (main.page_size_bytes + indexer.page_size_bytes)]
+    assert tensors[main_names[1]] is tensors[main_names[4]]
+    assert tensors[indexer_names[1]] is tensors[indexer_names[4]]
+    for i in range(4):
+        assert tensors[main_names[i]].data_ptr() != tensors[indexer_names[i]].data_ptr()
+    tensors[main_names[1]].fill_(17)
+    assert torch.all(tensors[main_names[4]] == 17)
+    assert torch.count_nonzero(tensors[indexer_names[1]]) == 0
+    assert torch.count_nonzero(tensors[main_names[0]]) == 0
+
+
+def test_glm_sfa_unregistered_cache_types_remain_resident():
+    names = [f"model.layers.{i}.self_attn" for i in range(6)]
+    config = _native_config([KVCacheGroupSpec(names, _attention_spec())])
+    assert plan_layerwise_cache_reuse(config, _runtime(6, 3, "glm_moe_dsa")) is None

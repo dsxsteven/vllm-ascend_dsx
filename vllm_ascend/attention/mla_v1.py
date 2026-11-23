@@ -178,7 +178,7 @@ class AscendMLAAttention(MLAAttention):
         # Preserve upstream metadata and apply all owner fields together.
         # Reuse the physical packing selected by the execution implementation.
         values.update(
-            num_heads=storage_heads,
+            num_query_heads=storage_heads,
             model_version=spec.model_version or getattr(self, "model_version", None),
             indexes_kv_by_block_stride=bool(
                 getattr(spec, "indexes_kv_by_block_stride", False) or getattr(self, "indexes_kv_by_block_stride", False)

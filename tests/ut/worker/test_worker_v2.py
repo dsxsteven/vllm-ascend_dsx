@@ -84,6 +84,55 @@ def test_triton_warmup_failure_prevents_capture(use_v2):
     worker.model_runner.capture_model.assert_not_called()
 
 
+@pytest.mark.parametrize("use_v2", [False, True])
+@pytest.mark.parametrize("pool", ["none", "engram", "gva", "multi_gva", "object", "non_layerwise"])
+def test_warmup_keeps_affinity_without_migrating_registered_host_pools(use_v2, pool):
+    from vllm_ascend.worker.worker import NPUWorker
+
+    transfer = None
+    if pool not in ("none", "engram"):
+        child = {
+            "kv_connector": "AscendStoreConnector",
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {
+                "backend": "mooncake" if pool == "object" else "memcache",
+                "use_layerwise": pool != "non_layerwise",
+            },
+        }
+        transfer = (
+            KVTransferConfig(**child)
+            if pool != "multi_gva"
+            else KVTransferConfig(
+                kv_connector="MultiConnector",
+                kv_role="kv_producer",
+                kv_connector_extra_config={"connectors": [child]},
+            )
+        )
+    worker = SimpleNamespace(
+        local_rank=3,
+        use_v2_model_runner=use_v2,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(compile_sizes=[], compilation_time=0.0),
+            engram_config=SimpleNamespace(cpu_offload=True) if pool == "engram" else None,
+            kv_transfer_config=transfer,
+        ),
+        model_config=SimpleNamespace(enforce_eager=True, seed=0),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=1),
+        model_runner=MagicMock(),
+    )
+    with (
+        patch("vllm_ascend.model_executor.warmup.kernel_warmup.kernel_warmup"),
+        patch("vllm_ascend.worker.worker.get_current_hardware_profile") as profile,
+        patch("vllm_ascend.worker.worker.get_ascend_config", return_value=SimpleNamespace(enable_cpu_binding=True)),
+        patch("vllm_ascend.worker.worker.current_platform.device_id_to_physical_device_id", return_value=7),
+        patch("vllm_ascend.worker.worker.bind_cpus") as bind,
+        patch("vllm_ascend.worker.worker.set_random_seed"),
+    ):
+        profile.return_value.supports.return_value = False
+        NPUWorker.compile_or_warm_up_model(worker)
+    bind.assert_called_once_with(3, npu_id=7, migrate_memory=pool not in ("engram", "gva", "multi_gva"))
+
+
 class TestNPUWorkerV2(TestBase):
     def test_worker_imports_planning_helpers_from_supported_lane(self):
         from vllm.v1.core import kv_cache_planning as planning

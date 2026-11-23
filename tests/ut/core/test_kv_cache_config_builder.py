@@ -20,7 +20,7 @@ pytest.importorskip(
 
 import torch
 from vllm.config import KVTransferConfig
-from vllm.v1.core.kv_cache_planning import DefaultKVCacheConfigBuilder
+from vllm.v1.core.kv_cache_planning import DefaultKVCacheConfigBuilder, _max_memory_usage_bytes_from_groups
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm_ascend.core import kv_cache_config_builder as builder_module
 from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
 from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
     register_ascend_kv_cache_specs,
 )
@@ -197,3 +199,49 @@ def test_turboquant_groups_use_packed_pool_bytes():
     pool_bytes = builder._get_pool_bytes_per_block(make_runtime(), groups)
     assert pool_bytes == tq_cache.pool_bytes_per_block(groups)
     assert pool_bytes >= sum(spec.page_size_bytes for spec in uniform.kv_cache_specs.values())
+
+
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.LBNHC])
+def test_glm_sfa_one_million_token_admission_uses_shared_cache_budget(layout):
+    runtime = make_runtime()
+    runtime.model_config.hf_config.model_type = "glm_moe_dsa"
+    runtime.model_config.hf_text_config = runtime.model_config.hf_config
+    runtime.model_config.get_total_num_hidden_layers = lambda: 78
+    runtime.model_config.max_model_len = 1048576
+    runtime.cache_config = SimpleNamespace(
+        num_gpu_blocks_override=None,
+        prefix_cache_retention_interval=0,
+        get_resolved_kv_cache_layout=lambda: layout,
+    )
+    runtime.parallel_config = SimpleNamespace(
+        tensor_parallel_size=1, decode_context_parallel_size=1, prefill_context_parallel_size=16
+    )
+    runtime.kv_transfer_config = KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={
+            "connectors": [
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_role": "kv_producer",
+                    "kv_connector_extra_config": {
+                        "backend": "memcache",
+                        "use_layerwise": True,
+                        "layerwise_num_shared_buffers": 3,
+                        "layerwise_independent_layers": [0],
+                    },
+                }
+            ]
+        },
+    )
+    main = AscendMLAAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=576, num_query_heads=64, dtype=torch.bfloat16
+    )
+    indexer = AscendSFAIndexerCacheSpec(block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+    specs = {f"model.layers.{i}.self_attn.attn": main for i in range(78)}
+    specs.update({f"model.layers.{i}.self_attn.indexer.k_cache": indexer for i in [0, 1, *range(2, 78, 4)]})
+    builder = AscendKVCacheConfigBuilder()
+    groups = builder.get_kv_cache_groups(runtime, specs)
+    required = _max_memory_usage_bytes_from_groups(builder, runtime, groups)
+    assert required == 4 * 1048576 * (576 + 128) * 2
+    assert required < 14 * 1024**3
