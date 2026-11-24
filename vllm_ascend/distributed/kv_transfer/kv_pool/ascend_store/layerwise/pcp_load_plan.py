@@ -4,7 +4,9 @@
 
 import numpy as np
 
-SHARD_CAPACITY = 4 * 1024 * 1024
+# Amortize readiness reductions and HCCL/scatter launches on long prefixes.
+# Keep each shard below the private communicator's 64 MiB buffer.
+SHARD_CAPACITY = 32 * 1024 * 1024
 _COLLECTIVE_ALIGNMENT = 512
 
 

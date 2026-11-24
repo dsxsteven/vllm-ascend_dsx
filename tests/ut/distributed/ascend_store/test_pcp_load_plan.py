@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pcp_load_plan import (
+    SHARD_CAPACITY,
     shard_window,
     slice_transfer,
 )
@@ -49,11 +50,11 @@ def test_restore_reads_each_source_byte_once(pcp, sizes):
 
 
 def test_large_layer_uses_bounded_windows_and_equal_shards():
-    total = 5 * 1024 * 1024 * 16 + 193
+    total = (SHARD_CAPACITY + 1024 * 1024) * 16 + 193
     for rank in range(16):
         windows = list(shard_window(total, 16, rank))
         assert len(windows) == 2
-        assert all(width <= 4 * 1024 * 1024 for _, _, width, _, _ in windows)
+        assert all(width <= SHARD_CAPACITY for _, _, width, _, _ in windows)
         assert all(width % 512 == 0 for _, _, width, _, _ in windows)
     totals = [sum(right - left for _, _, _, left, right in shard_window(total, 16, r)) for r in range(16)]
     assert sum(totals) == total

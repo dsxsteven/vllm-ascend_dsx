@@ -147,8 +147,8 @@ def test_staging_is_aligned_and_communicators_are_separate(monkeypatch):
     group = SimpleNamespace(ranks=[4, 5], world_size=2, rank_in_group=1)
     loader = pcp_load.PcpLayerwiseLoad(store, group)
     assert loader.local.data_ptr() % (2 * 1024 * 1024) == 0
-    assert loader.local.numel() == 4 * 1024 * 1024
-    assert loader.gathered.numel() == 8 * 1024 * 1024
+    assert loader.local.numel() == pcp_load.SHARD_CAPACITY
+    assert loader.gathered.numel() == pcp_load.SHARD_CAPACITY * group.world_size
     assert loader.control_group is not loader.device_group
     assert [call.kwargs["backend"] for call in create_group.call_args_list] == ["gloo", "hccl"]
     assert all(call.kwargs["ranks"] == [4, 5] for call in create_group.call_args_list)
