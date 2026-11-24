@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import get_backend_class
+from vllm_ascend.models.glm_moe_dsa_cache_reuse import normalize_offload_descriptors
 
 from .layerwise_cache_layout import (
     LayerwiseCacheConfig,
@@ -26,7 +27,10 @@ from .layerwise_cache_layout import (
 )
 
 SPEC_REUSE_RULES = MappingProxyType(
-    {"glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES"}
+    {
+        "glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES",
+        "glm_moe_dsa": "vllm_ascend.models.glm_moe_dsa_cache_reuse.GLM_MOE_DSA_SPEC_REUSE_RULES",
+    }
 )
 
 
@@ -282,6 +286,9 @@ def plan_layerwise_cache_reuse(
     rules = get_spec_reuse_rules(vllm_config)
     if rules is None:
         return None
+    text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    if getattr(text_config, "model_type", None) == "glm_moe_dsa":
+        normalize_offload_descriptors(vllm_config, kv_cache_config, get_layerwise_kv_cache_specs(kv_cache_config))
     planner = LayerwiseCachePlanner(
         kv_cache_config,
         vllm_config,
