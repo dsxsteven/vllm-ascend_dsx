@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
+import pytest
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -2560,8 +2561,6 @@ class TestEngramSharedMemoryDefaults(TestBase):
 
 
 def test_pcp_h2d_prefetch_requires_sharded_restore_and_defaults_off():
-    import pytest
-
     assert AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).kv_pool_pcp_h2d_prefetch is False
     assert AscendConfig(
         sparse_kv_offload_config=SparseKVOffloadConfig(), kv_pool_pcp_h2d_allgather=True, kv_pool_pcp_h2d_prefetch=True

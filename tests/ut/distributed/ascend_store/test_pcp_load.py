@@ -12,7 +12,9 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise import pcp_load
+from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise import pcp_load, pcp_load_plan
 
 
 def make_loader(monkeypatch, rank=0, world_size=2):
@@ -148,9 +150,6 @@ def test_plan_digest_tracks_logical_selection_not_virtual_addresses():
 @pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize("family", ["A3", "A5"])
 def test_staging_is_aligned_and_communicators_are_separate(monkeypatch, prefetch, family):
-    from vllm_ascend.device.hardware import AscendDeviceType
-    from vllm_ascend.device.hardware_profile import get_hardware_profile
-
     profile = get_hardware_profile(getattr(AscendDeviceType, family))
     monkeypatch.setattr(pcp_load, "get_current_hardware_profile", lambda: profile)
     real_device = torch.device
@@ -345,8 +344,6 @@ def test_device_status_failure_is_not_stale_and_uses_private_group(monkeypatch, 
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_batched_restore_preserves_async_buffer_lifetimes(monkeypatch, world_size, rank, prefetch):
     # Small shard capacity exercises seven windows and three batches cheaply.
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise import pcp_load_plan
-
     monkeypatch.setattr(pcp_load, "SHARD_CAPACITY", 512)
     monkeypatch.setattr(
         pcp_load,
@@ -524,8 +521,6 @@ def test_lookahead_is_local_only_and_does_not_advance_demand_cursor(monkeypatch)
 
 @pytest.mark.parametrize("failing_window", [0, 1, 2])
 def test_one_failed_read_rejects_the_entire_unpublished_batch(monkeypatch, failing_window):
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise import pcp_load_plan
-
     monkeypatch.setattr(pcp_load, "SHARD_CAPACITY", 512)
     monkeypatch.setattr(
         pcp_load,
