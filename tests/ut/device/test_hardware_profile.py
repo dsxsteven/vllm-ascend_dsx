@@ -353,3 +353,11 @@ def test_flash_attn_npu_3_supported_models(device_type, models) -> None:
     profile = get_hardware_profile(device_type)
     assert profile.flash_attn_npu_3_models == models
     assert profile.supports(HardwareCapability.FLASH_ATTN_NPU_3) == bool(models)
+
+
+@pytest.mark.parametrize("device_type", list(AscendDeviceType))
+def test_pcp_kv_scatter_tuning_preserves_other_hardware(device_type):
+    expected = 65536 if device_type is AscendDeviceType.A5 else 4096
+    profile = get_hardware_profile(device_type)
+    assert profile.pcp_kv_scatter_block_bytes == expected
+    assert profile.pcp_kv_device_status_reduce is (device_type is AscendDeviceType.A5)

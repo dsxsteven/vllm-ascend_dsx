@@ -173,3 +173,5 @@ class LayerLoadTask:
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
     attention_start_gate: AttentionComputeStartGate | None = None
+    # Local staging only: no collective, target write or completion publication.
+    pcp_prefetch_only: bool = False

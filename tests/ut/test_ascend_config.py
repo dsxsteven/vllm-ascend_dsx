@@ -2557,3 +2557,20 @@ class TestEngramSharedMemoryDefaults(TestBase):
         config.engram_config = None
         AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).derive_and_validate(config)
         self.assertIsNone(config.engram_config)
+
+
+def test_pcp_h2d_prefetch_requires_sharded_restore_and_defaults_off():
+    import pytest
+
+    assert AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).kv_pool_pcp_h2d_prefetch is False
+    assert AscendConfig(
+        sparse_kv_offload_config=SparseKVOffloadConfig(), kv_pool_pcp_h2d_allgather=True, kv_pool_pcp_h2d_prefetch=True
+    ).kv_pool_pcp_h2d_prefetch
+    with pytest.raises(ValueError, match="requires kv_pool_pcp_h2d_allgather"):
+        AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), kv_pool_pcp_h2d_prefetch=True)
+    with pytest.raises(ValueError):
+        AscendConfig(
+            sparse_kv_offload_config=SparseKVOffloadConfig(),
+            kv_pool_pcp_h2d_allgather=True,
+            kv_pool_pcp_h2d_prefetch="invalid",
+        )

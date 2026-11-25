@@ -15,8 +15,17 @@ def slice_transfer(sizes: np.ndarray, start: int, end: int) -> tuple[np.ndarray,
     if start < 0 or end < start or np.any(sizes < 0):
         raise ValueError("Invalid packed KV byte range")
     ends = np.cumsum(sizes, dtype=np.int64)
-    starts = ends - sizes
-    indices = np.flatnonzero((ends > start) & (starts < end) & (sizes > 0) & (end > start))
+    return slice_transfer_bounds(ends - sizes, ends, start, end)
+
+
+def slice_transfer_bounds(
+    starts: np.ndarray, ends: np.ndarray, start: int, end: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Slice a validated nonnegative layout whose cumulative bounds are reused."""
+    first = int(np.searchsorted(ends, start, side="right"))
+    last = int(np.searchsorted(starts, end, side="left"))
+    indices = np.arange(first, max(first, last), dtype=np.intp)
+    indices = indices[(ends[indices] > starts[indices]) & (end > start)]
     left = np.maximum(starts[indices], start)
     right = np.minimum(ends[indices], end)
     return indices, left - starts[indices], left - start, right - left

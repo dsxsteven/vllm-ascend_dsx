@@ -701,6 +701,7 @@ class AscendConfig:
     kv_trace: KVTraceConfig = dataclasses.field(default_factory=KVTraceConfig)
     kv_pool_range_debug: bool = False
     kv_pool_pcp_h2d_allgather: bool = False
+    kv_pool_pcp_h2d_prefetch: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
@@ -793,6 +794,8 @@ class AscendConfig:
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.kv_pool_pcp_h2d_prefetch and not self.kv_pool_pcp_h2d_allgather:
+            raise ValueError("kv_pool_pcp_h2d_prefetch requires kv_pool_pcp_h2d_allgather")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.

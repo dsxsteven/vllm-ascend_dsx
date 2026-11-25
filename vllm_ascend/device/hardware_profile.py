@@ -331,6 +331,12 @@ class HardwareProfile:
     # First row count where the integrated Qwen4Exp HC gate-mix wrapper is
     # faster than the one-row kernel on this hardware family.
     qwen4exp_hc_gate_mix_row_block_min_rows: int = 2048
+    # Byte-copy loop tile for PCP KV restoration. A5 measurements favor 64 KiB;
+    # retain the validated 4 KiB path on the other hardware families.
+    pcp_kv_scatter_block_bytes: int = 4096
+    # A5's private HCCL scalar reduction avoids the larger Gloo round trip.
+    # Other families retain the validated host-side failure-control path.
+    pcp_kv_device_status_reduce: bool = False
 
     def supports(self, capability: HardwareCapability) -> bool:
         """Return whether the exact documented ``capability`` contract is available."""
@@ -484,6 +490,8 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             # once CANN supports Step5 and the integration is validated.
             flash_attn_npu_3_models=frozenset({FlashAttentionNpu3Model.STEP5}),
             qwen4exp_hc_gate_mix_row_block_min_rows=1024,
+            pcp_kv_scatter_block_bytes=65536,
+            pcp_kv_device_status_reduce=True,
             requires_2d_nz_linear_input=True,
             minimax_m3_gbsa_bf16_softmax_precision=1,
             attention_backend_family=AttentionBackendFamily.STANDARD,

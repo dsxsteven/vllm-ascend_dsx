@@ -567,7 +567,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         if getattr(self, "pcp_load_enabled", False):
             from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pcp_load import PcpLayerwiseLoad
 
-            self.pcp_load = PcpLayerwiseLoad(self.m_store, get_pcp_group())
+            self.pcp_load = PcpLayerwiseLoad(
+                self.m_store, get_pcp_group(), prefetch=get_ascend_config().kv_pool_pcp_h2d_prefetch
+            )
         ready_event = threading.Event()
         self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
             self.m_store,
@@ -1680,7 +1682,27 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         while self.next_layer_to_submit <= window_end:
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
-            submit_layer_load(layer_id)
+            submitted = submit_layer_load(layer_id)
+            pcp_load = getattr(self, "pcp_load", None)
+            next_layer = layer_id + 1
+            if (
+                submitted
+                and pcp_load is not None
+                and getattr(pcp_load, "prefetch_enabled", False)
+                and next_layer < self.num_layers
+                and self.layer_load_tasks[next_layer]
+            ):
+                # FIFO receive ownership: publish demand L, then read only the
+                # local shards of L+1 while the model computes L. Its actual
+                # collective stays behind the next model-layer fence.
+                recv_thread.add_request(
+                    LayerLoadTask(
+                        wait_for_save_layers=(),
+                        transfer_tasks=self.layer_load_tasks[next_layer],
+                        layer_id=next_layer,
+                        pcp_prefetch_only=True,
+                    )
+                )
 
     def wait_for_layer_load_ready(self, layer_name: str) -> None:
         physical_layer = self._extract_physical_layer_index(layer_name)

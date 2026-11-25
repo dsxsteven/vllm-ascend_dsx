@@ -407,6 +407,45 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
         )
         return thread, load_finished, save_finished, sync_events
 
+    def test_pcp_prefetch_does_not_publish_or_wait_for_target_reuse(self):
+        thread, finished, _, _ = self._make_thread(external_slot_release_waiter=MagicMock())
+        thread.pcp_load = MagicMock()
+        thread._wait_for_reuse_saves = MagicMock(side_effect=AssertionError("prefetch must not wait for target"))
+        task = LayerTransferTask(
+            layer_id=1,
+            block_ranges=[],
+            shared_block_data=SharedBlockData(
+                block_ids_arr=np.array([0]),
+                block_gvas_arr=np.array([100]),
+                req_ids=["r1"],
+                is_last_chunks=[True],
+            ),
+        )
+        pending = LayerLoadTask((), [task], 1, pcp_prefetch_only=True)
+        thread.request_queue.put(pending)
+        thread._handle_request(pending)
+        assert not thread.pcp_load.defer_prefetch_error.called, thread.pcp_load.defer_prefetch_error.call_args
+        thread.pcp_load.prefetch.assert_called_once()
+        assert thread.pcp_load.prefetch.call_args.args[-1] is pending.transfer_tasks
+        thread.pcp_load.copy.assert_not_called()
+        thread.external_slot_release_waiter.assert_not_called()
+        assert not any(event.is_set() for event in finished)
+        assert not thread.get_and_clear_finished_requests()
+        assert thread.request_queue.unfinished_tasks == 0
+
+    def test_pcp_prefetch_builder_error_is_deferred_without_publication(self):
+        thread, finished, _, _ = self._make_thread()
+        thread.pcp_load = MagicMock()
+        error = RuntimeError("builder failed")
+        thread._copy_gva_layers = MagicMock(side_effect=error)
+        pending = LayerLoadTask((), [], 1, pcp_prefetch_only=True)
+        thread.request_queue.put(pending)
+        thread._handle_request(pending)
+        thread.pcp_load.defer_prefetch_error.assert_called_once_with(pending.transfer_tasks, error)
+        thread.raise_if_failed()
+        assert not any(event.is_set() for event in finished)
+        assert thread.request_queue.unfinished_tasks == 0
+
     def test_gva_load_failure_policy(self):
         for hybrid in (False, True):
             with self.subTest(hybrid=hybrid):
