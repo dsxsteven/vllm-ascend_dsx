@@ -5,6 +5,7 @@
 import ctypes
 import queue
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -213,7 +214,8 @@ def test_mixed_overlap_flags_are_rejected_before_step(monkeypatch):
 
 @pytest.mark.parametrize("family", ["A3", "A5"])
 @pytest.mark.parametrize("world_size", [2, 8, 16])
-def test_byte_exact_restore_executes_while_compute_is_inflight(monkeypatch, family, world_size):
+@pytest.mark.parametrize("include_indexer", [False, True])
+def test_byte_exact_restore_executes_while_compute_is_inflight(monkeypatch, family, world_size, include_indexer):
     monkeypatch.setattr(pcp_load, "SHARD_CAPACITY", 512)
     monkeypatch.setattr(
         pcp_load,
@@ -274,17 +276,25 @@ def test_byte_exact_restore_executes_while_compute_is_inflight(monkeypatch, fami
     thread = threading.Thread(target=receive, daemon=True)
     thread.start()
     bind_window(worker, 2)
-    with attention_fence.attention_transfer_window(allow_pcp_overlap=True):
-        # Simulate submitting a long asynchronous attention kernel. The main
-        # thread does not wait for KV before the compute submission itself.
-        calls.append("submit_attention")
-        compute_submitted.set()
+    scope = attention_fence.indexer_attention_transfer_window() if include_indexer else nullcontext()
+    with scope:
+        if include_indexer:
+            attention_fence.start_local_indexer_transfer_overlap()
+            calls.append("submit_indexer")
+            compute_submitted.set()
+        with attention_fence.attention_transfer_window(allow_pcp_overlap=True):
+            # Simulate asynchronous model kernels; no KV join between LI/SFA.
+            assert worker._pcp_overlap_layer == 3
+            calls.append("submit_attention")
+            compute_submitted.set()
     calls.append("next_model_collective")
     thread.join(timeout=5)
     assert not thread.is_alive() and not errors, errors
     assert restore_finished.is_set()
-    assert calls[0] == "submit_attention"
-    assert calls[-2:] == ["scatter_complete", "next_model_collective"]
+    assert calls[0] == ("submit_indexer" if include_indexer else "submit_attention")
+    torch.npu.synchronize.assert_called_once_with(loader.device)
+    assert calls.index("scatter_complete") < calls.index("next_model_collective")
+    assert calls[-1] == "next_model_collective"
     assert calls.count("allgather_during_compute") == 3
     assert torch.equal(target[16:-16], source)
     assert torch.all(target[:16] == 0xA5) and torch.all(target[-16:] == 0xA5)

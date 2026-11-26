@@ -732,6 +732,7 @@ class TestAscendSFAKPathFusion(TestBase):
         indexer.use_pcp = False
         indexer._use_fused_cache_store = False
         indexer._sharded_dcp = False
+        indexer._dcp_size = 1
         indexer._local_topk = False
         indexer.write_cache = MagicMock()
 
@@ -741,6 +742,7 @@ class TestAscendSFAKPathFusion(TestBase):
         indexer_metadata = SimpleNamespace(
             num_actual_tokens=num_tokens,
             kv_gather_block_ids=None,
+            topk_selector=None,
             cos=cos,
             sin=sin,
             slot_mapping=torch.arange(num_tokens, dtype=torch.int64).view(-1, 1),

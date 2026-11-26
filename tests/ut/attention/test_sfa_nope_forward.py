@@ -13,6 +13,7 @@ import vllm_ascend.attention.sfa_v1 as sparse_mla
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPImpl, AscendSFADCPMetadata
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, PreprocessType
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import attention_fence
 
 
 @pytest.fixture(autouse=True)
@@ -506,7 +507,7 @@ def test_sparse_mla_full_forward_uses_real_rows_and_latent_values(graph_mode, em
     [(False, False, True), (False, True, False), (True, False, True)],
 )
 def test_nope_pcp_forward_preserves_collective_rows_on_empty_and_uneven_ranks(
-    dcp_enabled, sharded_decode, global_prefill, actual_tokens, graph_mode
+    monkeypatch, dcp_enabled, sharded_decode, global_prefill, actual_tokens, graph_mode
 ):
     """Run the real forward entry; PCP peers need the same padded row count."""
     impl_cls = AscendSFADCPImpl if dcp_enabled else AscendSFAImpl
@@ -563,18 +564,38 @@ def test_nope_pcp_forward_preserves_collective_rows_on_empty_and_uneven_ranks(
     impl._execute_sparse_flash_attention_process = MagicMock(return_value=torch.ones(4, 2))
     impl._v_up_proj = lambda value: value
     impl._finalize_o_proj = MagicMock(side_effect=lambda value, output: output.copy_(value))
+    monkeypatch.setattr(attention_fence, "_attention_compute_start_gate", None)
+    monkeypatch.setattr(torch.npu, "Event", MagicMock())
+    gate = attention_fence.reset_attention_compute_start_gate()
+    order = []
+    gate.on_overlap_start = lambda: order.append("restore_start")
+    gate.on_overlap_finish = lambda: order.append("restore_join")
+    gate.on_start = lambda: order.append("save_gate")
+
+    def indexer(*args, **kwargs):
+        if not dcp_enabled:
+            attention_fence.start_local_indexer_transfer_overlap()
+        order.append("indexer")
+        return torch.zeros(4, 1, 1, dtype=torch.int32)
+
+    impl.indexer.side_effect = indexer
+    impl._execute_sparse_flash_attention_process.side_effect = lambda *args: (order.append("sfa") or torch.ones(4, 2))
     with (
         patch.object(
             sparse_mla, "get_forward_context", return_value=SimpleNamespace(cudagraph_runtime_mode=graph_mode)
         ),
         patch.object(sparse_mla, "wait_for_kv_layer_from_connector"),
-        patch.object(sparse_mla, "notify_kv_cache_written"),
-        patch.object(sparse_mla, "attention_transfer_window"),
+        patch.object(sparse_mla, "notify_kv_cache_written", side_effect=lambda *args: order.append("cache_notify")),
         patch.object(sparse_mla, "maybe_save_kv_layer_to_connector"),
     ):
         output = torch.empty_like(hidden)
         assert impl.forward("layer", hidden, (), metadata, output) is output
     impl._get_sfa_kv_slot_mapping.assert_called_once_with(metadata)
+    expected = ["indexer", "cache_notify", "save_gate"]
+    expected.insert(3 if dcp_enabled else 0, "restore_start")
+    if actual_tokens:
+        expected.append("sfa")
+    assert order == expected + ["restore_join"]
     assert impl.exec_kv.call_args.args[0].shape[0] == 4
     assert impl.exec_kv.call_args.args[4] is metadata.slot_mapping
     assert impl.exec_kv.call_args.kwargs == {"defer_wait": True}

@@ -50,6 +50,9 @@ from vllm_ascend.attention.utils import split_decodes_and_prefills, uses_pcp_sha
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
+    start_local_indexer_transfer_overlap,
+)
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
@@ -303,6 +306,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         # non-replicated token across the CP group. Base layout is a no-op.
         parallel_config = get_current_vllm_config().parallel_config
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self._dcp_size = parallel_config.decode_context_parallel_size
         self._is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(get_current_vllm_config())
         self._use_fused_cache_store = (
             type(self) is AscendSFAIndexerBackend
@@ -858,6 +862,17 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         )
         return q_stream, fuse_cache, fuse_store
 
+    def _start_local_topk_overlap(self, metadata: AscendSFAIndexerMetadata) -> None:
+        # DCP gather/distributed top-k and custom selectors retain the SFA-only
+        # window. The decision must not depend on this rank's query count.
+        if (
+            self._dcp_size == 1
+            and not self._sharded_dcp
+            and metadata.kv_gather_block_ids is None
+            and metadata.topk_selector is None
+        ):
+            start_local_indexer_transfer_overlap()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -915,6 +930,9 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         else:
             self.write_cache(k_li, k_li_scale, slot_mapping, indexer_metadata.cache_scatter_indices)
         if not compute_topk:
+            # Empty-query and index-reuse ranks must join the same restore as
+            # ranks that run LI, after their cache gathers/writes have finished.
+            self._start_local_topk_overlap(indexer_metadata)
             return None
 
         kv_cache = self.k_cache.kv_cache
@@ -953,6 +971,9 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         for handle in handles:
             if handle is not None:
                 handle.wait()
+        # Only local selection remains; the bounded SFA scope joins restoration
+        # after SFA, with no second fence between the LI and SFA kernels.
+        self._start_local_topk_overlap(indexer_metadata)
         if indexer_metadata.num_actual_tokens == 0:
             return None
 

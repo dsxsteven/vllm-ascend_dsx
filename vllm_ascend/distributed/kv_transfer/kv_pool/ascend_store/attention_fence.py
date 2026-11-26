@@ -45,6 +45,22 @@ class AttentionComputeStartGate:
         self.on_overlap_start: Callable[[], None] | None = None
         self.on_overlap_finish: Callable[[], None] | None = None
         self._event: torch.npu.Event | None = None
+        self.indexer_scope_depth = 0
+        self._overlap_started = False
+        self._overlap_finished = False
+
+    def start_overlap(self) -> None:
+        """Start once per layer, even when LI and SFA share the window."""
+        if not self._overlap_started and self.on_overlap_start is not None:
+            # Mark before invoking: an enqueue failure may leave work to join.
+            self._overlap_started = True
+            self.on_overlap_start()
+
+    def finish_overlap(self) -> None:
+        if self._overlap_started and not self._overlap_finished:
+            self._overlap_finished = True
+            if self.on_overlap_finish is not None:
+                self.on_overlap_finish()
 
     def record(
         self,
@@ -110,6 +126,36 @@ def record_attention_compute_start() -> None:
 
 
 @contextmanager
+def indexer_attention_transfer_window():
+    """Bound an optional local-LI start through the following SFA submission.
+
+    Entering this scope does not start transfers: the indexer must first finish
+    its cache writes and model collectives. Keep the legacy save gate at SFA.
+    The outer finally also joins work if LI raises before reaching SFA.
+    """
+    with _lock:
+        gate = _attention_compute_start_gate
+    if gate is None:
+        yield
+        return
+    gate.indexer_scope_depth += 1
+    try:
+        yield
+    finally:
+        gate.indexer_scope_depth -= 1
+        if gate.indexer_scope_depth == 0:
+            gate.finish_overlap()
+
+
+def start_local_indexer_transfer_overlap() -> None:
+    """Open PCP restore only inside an explicitly bounded LI/SFA scope."""
+    with _lock:
+        gate = _attention_compute_start_gate
+    if gate is not None and gate.indexer_scope_depth:
+        gate.start_overlap()
+
+
+@contextmanager
 def attention_transfer_window(*, allow_pcp_overlap: bool = False):
     """Run the configured transfer completion policy after attention submission.
 
@@ -124,13 +170,13 @@ def attention_transfer_window(*, allow_pcp_overlap: bool = False):
         return
     try:
         gate.record()
-        if allow_pcp_overlap and gate.on_overlap_start is not None:
-            gate.on_overlap_start()
+        if allow_pcp_overlap:
+            gate.start_overlap()
         yield
     finally:
         try:
-            if allow_pcp_overlap and gate.on_overlap_finish is not None:
-                gate.on_overlap_finish()
+            if allow_pcp_overlap:
+                gate.finish_overlap()
         finally:
             if gate.on_finish is not None:
                 gate.on_finish()

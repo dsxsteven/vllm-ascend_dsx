@@ -153,6 +153,7 @@ def test_indexer_history_collectives_follow_writes_and_include_empty_receivers(
     caches = (torch.arange(12).reshape(3, 2, 1, 2).to(dtype), torch.ones(3, 2, 1, 1))
     model.k_cache = SimpleNamespace(kv_cache=caches)
     model._sharded_dcp = True
+    model._dcp_size = 2
     model.topk_tokens = 1024
     model.enable_sparse_li_c8 = True
     model.enable_sparse_li_c4 = model.use_torch_npu_lightning_indexer = False

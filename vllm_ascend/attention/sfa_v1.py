@@ -54,6 +54,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     attention_transfer_window,
+    indexer_attention_transfer_window,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     OFFLOAD_K_CACHE_NPU_INDEX,
@@ -2249,61 +2250,63 @@ class AscendSFAImpl(MLAAttentionImpl):
         # A sharded-decode PCP rank can own no request but must still write
         # and gather KV with the other ranks.
         has_local_query = attn_metadata.num_actual_tokens > 0
-        if self.runtime_has_indexer:
-            # One unified indexer call: k path -> cache write -> top-k
-            # selection (the selection kernel reads the freshly written
-            # cache). MTP skip_topk layers still run the k path and the write
-            # (compute_topk=False) so their cache stays up to date, then
-            # reuse the shared top-k indices. Cache layout, RoPE, parallel
-            # sequence lengths, and decode count all come from the indexer's
-            # independently built metadata.
-            assert k_hidden_states is not None
-            assert indexer_attn_metadata is not None
-            self._prepare_indexer_metadata(indexer_attn_metadata, attn_metadata)
-            self._before_indexer(attn_metadata)
-            topk_indices = self.indexer(
-                hidden_states,
-                q_c,
-                k_hidden_states,
-                indexer_attn_metadata,
-                compute_topk=not self.skip_topk
-                and (has_local_query or getattr(indexer_attn_metadata, "kv_gather_block_ids", None) is not None),
-            )
-            # Release pending indexer receive buffers after their consumer.
-            k_hidden_states = None
-            if self.skip_topk:
-                topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
-            elif self.use_index_cache and has_local_query:
-                self._update_indexcache_topk_indices(topk_indices)
-        elif self.skip_topk:
-            # Static shared-index layers keep no runtime indexer cache and
-            # only reuse the shared top-k indices.
-            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
-        else:
-            raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
-
-        # Notify for every layer that wrote the cache, not just indexer layers:
-        # by this point all of the layer's KV (main + indexer) has been
-        # scattered - indexer layers persisted it inside indexer.forward
-        # above - so the connector can dispatch the PD pull.
-        notify_kv_cache_written(self.layer_name or "")
-
-        # Open the prefetch gate for every SFA layer. Some GLM-5.2 layers
-        # reuse cached top-k indices and have no indexer, so recording this
-        # inside the indexer's forward would leave their gate closed.
-        # All PCP/TP cache updates precede this window; O-proj and MC2 follow
-        # it. Empty-query ranks must enter as well to preserve collective order.
-        with attention_transfer_window(allow_pcp_overlap=True):
-            if has_local_query:
-                attn_output = self._execute_sparse_flash_attention_process(
-                    ql_nope,
-                    q_pe,
-                    kv_cache,
-                    topk_indices,
-                    attn_metadata,
-                    actual_seq_lengths_query,
-                    actual_seq_lengths_key,
+        # The indexer opens the window only after its model collectives.
+        with indexer_attention_transfer_window():
+            if self.runtime_has_indexer:
+                # One unified indexer call: k path -> cache write -> top-k
+                # selection (the selection kernel reads the freshly written
+                # cache). MTP skip_topk layers still run the k path and the write
+                # (compute_topk=False) so their cache stays up to date, then
+                # reuse the shared top-k indices. Cache layout, RoPE, parallel
+                # sequence lengths, and decode count all come from the indexer's
+                # independently built metadata.
+                assert k_hidden_states is not None
+                assert indexer_attn_metadata is not None
+                self._prepare_indexer_metadata(indexer_attn_metadata, attn_metadata)
+                self._before_indexer(attn_metadata)
+                topk_indices = self.indexer(
+                    hidden_states,
+                    q_c,
+                    k_hidden_states,
+                    indexer_attn_metadata,
+                    compute_topk=not self.skip_topk
+                    and (has_local_query or getattr(indexer_attn_metadata, "kv_gather_block_ids", None) is not None),
                 )
+                # Release pending indexer receive buffers after their consumer.
+                k_hidden_states = None
+                if self.skip_topk:
+                    topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
+                elif self.use_index_cache and has_local_query:
+                    self._update_indexcache_topk_indices(topk_indices)
+            elif self.skip_topk:
+                # Static shared-index layers keep no runtime indexer cache and
+                # only reuse the shared top-k indices.
+                topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
+            else:
+                raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
+
+            # Notify for every layer that wrote the cache, not just indexer layers:
+            # by this point all of the layer's KV (main + indexer) has been
+            # scattered - indexer layers persisted it inside indexer.forward
+            # above - so the connector can dispatch the PD pull.
+            notify_kv_cache_written(self.layer_name or "")
+
+            # Open the prefetch gate for every SFA layer. Some GLM-5.2 layers
+            # reuse cached top-k indices and have no indexer, so recording this
+            # inside the indexer's forward would leave their gate closed.
+            # All PCP/TP cache updates precede this window; O-proj and MC2 follow
+            # it. Empty-query ranks must enter as well to preserve collective order.
+            with attention_transfer_window(allow_pcp_overlap=True):
+                if has_local_query:
+                    attn_output = self._execute_sparse_flash_attention_process(
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        topk_indices,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
+                    )
 
         if has_local_query:
             attn_output = self._v_up_proj(attn_output)
