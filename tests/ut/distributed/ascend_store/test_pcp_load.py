@@ -26,6 +26,7 @@ def make_loader(monkeypatch, rank=0, world_size=2):
     loader._read_status = None
     loader._control_status = torch.empty((), dtype=torch.int32)
     loader.prefetch_enabled = False
+    loader.overlap_enabled = False
     loader.batch_windows = 1
     loader._prepared = None
     loader._descriptor_capacity = 0
@@ -148,8 +149,9 @@ def test_plan_digest_tracks_logical_selection_not_virtual_addresses():
 
 
 @pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("family", ["A3", "A5"])
-def test_staging_is_aligned_and_communicators_are_separate(monkeypatch, prefetch, family):
+def test_staging_is_aligned_and_communicators_are_separate(monkeypatch, prefetch, overlap, family):
     profile = get_hardware_profile(getattr(AscendDeviceType, family))
     monkeypatch.setattr(pcp_load, "get_current_hardware_profile", lambda: profile)
     real_device = torch.device
@@ -162,8 +164,9 @@ def test_staging_is_aligned_and_communicators_are_separate(monkeypatch, prefetch
     monkeypatch.setattr(pcp_load.dist, "destroy_process_group", destroy_group)
     store = SimpleNamespace(device_id=0, register_buffer=MagicMock(), unregister_buffer=MagicMock())
     group = SimpleNamespace(ranks=[4, 5], world_size=2, rank_in_group=1)
-    loader = pcp_load.PcpLayerwiseLoad(store, group, prefetch=prefetch)
-    assert len(loader.locals) == (3 if prefetch else 1)
+    loader = pcp_load.PcpLayerwiseLoad(store, group, prefetch=prefetch, overlap=overlap)
+    assert loader.overlap_enabled is overlap
+    assert len(loader.locals) == (3 if prefetch or overlap else 1)
     assert all(local.data_ptr() % (2 * 1024 * 1024) == 0 for local in loader.locals)
     assert loader.local.data_ptr() % (2 * 1024 * 1024) == 0
     assert loader.local.numel() == pcp_load.SHARD_CAPACITY
@@ -552,8 +555,8 @@ def test_rank_pipeline_configuration_mismatch_is_rejected(monkeypatch):
     loader = make_loader(monkeypatch)
 
     def gather(output, identity, **kwargs):
-        signature, windows, device_status, prefetch = identity
-        output[:] = [identity, (signature, windows + 1, device_status, prefetch)]
+        signature, windows, device_status, prefetch, overlap = identity
+        output[:] = [identity, (signature, windows + 1, device_status, prefetch, overlap)]
 
     monkeypatch.setattr(pcp_load.dist, "all_gather_object", gather)
     with pytest.raises(RuntimeError, match="plans differ"):

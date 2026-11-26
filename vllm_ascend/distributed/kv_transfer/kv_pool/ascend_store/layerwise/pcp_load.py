@@ -38,7 +38,7 @@ _PREFETCH_SHARDS = 3
 class PcpLayerwiseLoad:
     """One receive thread owns staging and an independent PCP communicator."""
 
-    def __init__(self, store: Backend, pcp_group: GroupCoordinator, *, prefetch: bool = False):
+    def __init__(self, store: Backend, pcp_group: GroupCoordinator, *, prefetch: bool = False, overlap: bool = False):
         self.store = store
         self.world_size = pcp_group.world_size
         self.rank = pcp_group.rank_in_group
@@ -47,8 +47,9 @@ class PcpLayerwiseLoad:
         self.copy_block_bytes = profile.pcp_kv_scatter_block_bytes
         self._use_device_status_reduce = profile.pcp_kv_device_status_reduce
         self._plan_cache: OrderedDict = OrderedDict()
-        self.prefetch_enabled = prefetch
-        self.batch_windows = _PREFETCH_SHARDS if prefetch else 1
+        self.overlap_enabled = overlap
+        self.prefetch_enabled = prefetch or overlap
+        self.batch_windows = _PREFETCH_SHARDS if self.prefetch_enabled else 1
         self._prepared = None
         self._control_status = torch.empty((), dtype=torch.int32, device="cpu")
         self._descriptor_capacity = 0
@@ -94,7 +95,7 @@ class PcpLayerwiseLoad:
         self.restored_bytes = 0
         logger.info(
             "PCP layerwise H2D all-gather enabled: rank=%d/%d shard_buffer=%d bytes "
-            "scatter_block=%d bytes device_status_reduce=%s prefetch=%s batch_windows=%d",
+            "scatter_block=%d bytes device_status_reduce=%s prefetch=%s batch_windows=%d overlap=%s",
             self.rank,
             self.world_size,
             SHARD_CAPACITY,
@@ -102,6 +103,7 @@ class PcpLayerwiseLoad:
             self._use_device_status_reduce,
             self.prefetch_enabled,
             self.batch_windows,
+            self.overlap_enabled,
         )
 
     def validate_plan(self, signature: str) -> None:
@@ -113,7 +115,13 @@ class PcpLayerwiseLoad:
         # A token retains the old task list, so identity cannot alias a new step.
         self.reset_prefetch()
         signatures = [None] * self.world_size
-        plan_identity = (signature, self.batch_windows, self._read_status is not None, self.prefetch_enabled)
+        plan_identity = (
+            signature,
+            self.batch_windows,
+            self._read_status is not None,
+            self.prefetch_enabled,
+            self.overlap_enabled,
+        )
         dist.all_gather_object(signatures, plan_identity, group=self.control_group)
         if any(value != signatures[0] for value in signatures):
             raise RuntimeError("PCP layerwise load plans differ across ranks; refusing to mix KV data")
@@ -124,8 +132,8 @@ class PcpLayerwiseLoad:
             status.fill_(int(failed))
             group = self.control_group
         else:
-            # Called on the receive stream after the model-layer fence, before
-            # the data all-gather. Every rank checks this result before scatter.
+            # The demand fence or bounded attention window orders this receive
+            # stream against model collectives. Check every rank before scatter.
             status = self._read_status
             status.fill_(int(failed))
             group = self.device_group

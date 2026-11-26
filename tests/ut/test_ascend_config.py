@@ -2560,16 +2560,18 @@ class TestEngramSharedMemoryDefaults(TestBase):
         self.assertIsNone(config.engram_config)
 
 
-def test_pcp_h2d_prefetch_requires_sharded_restore_and_defaults_off():
-    assert AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).kv_pool_pcp_h2d_prefetch is False
-    assert AscendConfig(
-        sparse_kv_offload_config=SparseKVOffloadConfig(), kv_pool_pcp_h2d_allgather=True, kv_pool_pcp_h2d_prefetch=True
-    ).kv_pool_pcp_h2d_prefetch
+@pytest.mark.parametrize("key", ["kv_pool_pcp_h2d_prefetch", "kv_pool_pcp_restore_overlap"])
+def test_pcp_h2d_prefetch_requires_sharded_restore_and_defaults_off(key):
+    assert getattr(AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()), key) is False
+    assert getattr(
+        AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), kv_pool_pcp_h2d_allgather=True, **{key: True}),
+        key,
+    )
     with pytest.raises(ValueError, match="requires kv_pool_pcp_h2d_allgather"):
-        AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), kv_pool_pcp_h2d_prefetch=True)
+        AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig(), **{key: True})
     with pytest.raises(ValueError):
         AscendConfig(
             sparse_kv_offload_config=SparseKVOffloadConfig(),
             kv_pool_pcp_h2d_allgather=True,
-            kv_pool_pcp_h2d_prefetch="invalid",
+            **{key: "invalid"},
         )

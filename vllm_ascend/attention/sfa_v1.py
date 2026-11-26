@@ -2291,7 +2291,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Open the prefetch gate for every SFA layer. Some GLM-5.2 layers
         # reuse cached top-k indices and have no indexer, so recording this
         # inside the indexer's forward would leave their gate closed.
-        with attention_transfer_window():
+        # All PCP/TP cache updates precede this window; O-proj and MC2 follow
+        # it. Empty-query ranks must enter as well to preserve collective order.
+        with attention_transfer_window(allow_pcp_overlap=True):
             if has_local_query:
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope,

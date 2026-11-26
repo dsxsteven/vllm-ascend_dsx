@@ -1230,7 +1230,7 @@ def test_native_pcp_dcp_packed_kv_preserves_gathered_payload_addresses(
         ),
         patch.object(sparse_mla, "wait_for_kv_layer_from_connector"),
         patch.object(sparse_mla, "notify_kv_cache_written"),
-        patch.object(sparse_mla, "attention_transfer_window", side_effect=nullcontext),
+        patch.object(sparse_mla, "attention_transfer_window", side_effect=lambda **kwargs: nullcontext()),
         patch.object(sparse_mla, "maybe_save_kv_layer_to_connector"),
     ):
         for _ in range(2):
@@ -2023,7 +2023,8 @@ def test_sfa_pcp_builder_prepares_local_prolog_slots():
     torch.testing.assert_close(metadata.pcp_prolog_global_slots, torch.tensor([1, 2, -1, -1, 3, -1]))
 
 
-def test_sfa_pcp_empty_local_prefill_joins_kv_gathers():
+@pytest.mark.parametrize("actual_tokens", [0, 2])
+def test_sfa_pcp_empty_local_prefill_joins_kv_gathers(actual_tokens):
     impl = AscendSFAImpl.__new__(AscendSFAImpl)
     impl.pcp_enabled = True
     impl.is_pcp_decode_sharded = False
@@ -2054,7 +2055,8 @@ def test_sfa_pcp_empty_local_prefill_joins_kv_gathers():
         patch("vllm_ascend.attention.sfa_v1.copy_pcp_kv_cache", return_value=packed) as copy_cache,
         patch("vllm_ascend.attention.sfa_v1.DeviceOperator.reshape_and_cache") as write_cache,
     ):
-        _run_fused_forward(impl, hidden, cache, slots, metadata)
+        _run_fused_forward(impl, hidden, cache, slots, metadata, actual_tokens=actual_tokens)
+    assert impl._execute_sparse_flash_attention_process.call_count == int(actual_tokens > 0)
     torch.testing.assert_close(preprocess.call_args.kwargs["slot_mapping"], torch.tensor([0, -1]))
     torch.testing.assert_close(copy_cache.call_args.args[1], torch.tensor([-1]))
     group.all_gather.assert_called_once_with(packed, dim=0)
@@ -2203,7 +2205,9 @@ def test_sfa_pcp_nope_gathers_latent_kv_without_rope(dcp_enabled, mode):
         torch.testing.assert_close(group.all_gather.call_args.args[0], gathered_input)
 
 
-def _run_fused_forward(impl, hidden, cache, slots, metadata, preprocess_type=PreprocessType.PROLOG_V3, num_layers=1):
+def _run_fused_forward(
+    impl, hidden, cache, slots, metadata, preprocess_type=PreprocessType.PROLOG_V3, num_layers=1, actual_tokens=None
+):
     """Exercise the shared forward while mocking device computation boundaries."""
     impl.enable_sparse_sfa_c8 = getattr(impl, "enable_sparse_sfa_c8", False)
     impl.enable_sparse_sfa_turboquant = False
@@ -2226,17 +2230,19 @@ def _run_fused_forward(impl, hidden, cache, slots, metadata, preprocess_type=Pre
     metadata.slot_mapping = slots[: hidden.shape[0]]
     metadata.pcp_slot_mapping = slots
     metadata.num_input_tokens = hidden.shape[0]
-    metadata.num_actual_tokens = hidden.shape[0]
+    metadata.num_actual_tokens = hidden.shape[0] if actual_tokens is None else actual_tokens
     metadata.attn_state = AscendAttentionState.ChunkedPrefill
     metadata.cum_query_lens = metadata.seq_lens = torch.tensor([hidden.shape[0]])
     with (
         patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector"),
         patch("vllm_ascend.attention.sfa_v1.notify_kv_cache_written"),
-        patch("vllm_ascend.attention.sfa_v1.attention_transfer_window"),
+        patch("vllm_ascend.attention.sfa_v1.attention_transfer_window") as window,
         patch("vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector"),
     ):
         for _ in range(num_layers):
+            window.reset_mock()
             output = impl.forward(impl.layer_name, hidden, cache, metadata, output=torch.empty_like(hidden))
+            window.assert_called_once_with(allow_pcp_overlap=True)
         return output
 
 

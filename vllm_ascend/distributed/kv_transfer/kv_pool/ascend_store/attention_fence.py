@@ -40,6 +40,10 @@ class AttentionComputeStartGate:
         self._condition = threading.Condition()
         self.on_start: Callable[[], None] | None = None
         self.on_finish: Callable[[], None] | None = None
+        # Only explicitly bounded, collective-free attention implementations
+        # may open this window. A bare record() must never launch PCP collectives.
+        self.on_overlap_start: Callable[[], None] | None = None
+        self.on_overlap_finish: Callable[[], None] | None = None
         self._event: torch.npu.Event | None = None
 
     def record(
@@ -60,6 +64,8 @@ class AttentionComputeStartGate:
         """Release gated tasks after their caller has set its transfer abort flag."""
         self.on_start = None
         self.on_finish = None
+        self.on_overlap_start = None
+        self.on_overlap_finish = None
         self.record()
 
     def wait(self, timeout: float = 10.0) -> bool:
@@ -104,7 +110,7 @@ def record_attention_compute_start() -> None:
 
 
 @contextmanager
-def attention_transfer_window():
+def attention_transfer_window(*, allow_pcp_overlap: bool = False):
     """Run the configured transfer completion policy after attention submission.
 
     The event is recorded after cache writes and any preceding collectives. The
@@ -118,7 +124,13 @@ def attention_transfer_window():
         return
     try:
         gate.record()
+        if allow_pcp_overlap and gate.on_overlap_start is not None:
+            gate.on_overlap_start()
         yield
     finally:
-        if gate.on_finish is not None:
-            gate.on_finish()
+        try:
+            if allow_pcp_overlap and gate.on_overlap_finish is not None:
+                gate.on_overlap_finish()
+        finally:
+            if gate.on_finish is not None:
+                gate.on_finish()

@@ -111,11 +111,18 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self.dspark_prefix_cache: DSparkPrefixCache | None = None
         self._init_layerwise_config()
         self.pcp_load: PcpLayerwiseLoad | None = None
+        self._pcp_overlap_layer: int | None = None
         self.pcp_load_enabled = (
             "kv_pool_pcp_h2d_allgather" in vllm_config.additional_config
             and get_ascend_config().kv_pool_pcp_h2d_allgather
             and self.pcp_size > 1
         )
+        if (
+            self.pcp_load_enabled
+            and getattr(get_ascend_config(), "kv_pool_pcp_restore_overlap", False)
+            and not vllm_config.model_config.enforce_eager
+        ):
+            raise ValueError("kv_pool_pcp_restore_overlap requires enforce_eager=True")
         if self.pcp_load_enabled and not (
             self.backend_name == "memcache"
             and self.layerwise_offload
@@ -568,7 +575,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pcp_load import PcpLayerwiseLoad
 
             self.pcp_load = PcpLayerwiseLoad(
-                self.m_store, get_pcp_group(), prefetch=get_ascend_config().kv_pool_pcp_h2d_prefetch
+                self.m_store,
+                get_pcp_group(),
+                prefetch=get_ascend_config().kv_pool_pcp_h2d_prefetch,
+                overlap=get_ascend_config().kv_pool_pcp_restore_overlap,
             )
         ready_event = threading.Event()
         self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
@@ -743,6 +753,11 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 signature.update(shared_signatures[shared_id])
                 signature.update(json.dumps((task.group_id, task.layer_idx_in_group)).encode())
         signature.update(json.dumps(self.group_block_len, sort_keys=True).encode())
+        if getattr(self.pcp_load, "overlap_enabled", False) is True:
+            # Eligibility must be identical on every rank, including ranks
+            # without local query tokens. Addresses remain process-local.
+            signature.update(json.dumps(self.prefetch_layer_map, sort_keys=True).encode())
+            signature.update(json.dumps(getattr(self, "_dflash_draft_start_layer", None)).encode())
         self.pcp_load.validate_plan(signature.hexdigest())
 
     def _is_layerwise_save_leader(self) -> bool:
@@ -1683,26 +1698,80 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
             submitted = submit_layer_load(layer_id)
-            pcp_load = getattr(self, "pcp_load", None)
-            next_layer = layer_id + 1
-            if (
-                submitted
-                and pcp_load is not None
-                and getattr(pcp_load, "prefetch_enabled", False)
-                and next_layer < self.num_layers
-                and self.layer_load_tasks[next_layer]
-            ):
-                # FIFO receive ownership: publish demand L, then read only the
-                # local shards of L+1 while the model computes L. Its actual
-                # collective stays behind the next model-layer fence.
-                recv_thread.add_request(
-                    LayerLoadTask(
-                        wait_for_save_layers=(),
-                        transfer_tasks=self.layer_load_tasks[next_layer],
-                        layer_id=next_layer,
-                        pcp_prefetch_only=True,
-                    )
+            if submitted:
+                self._submit_pcp_h2d_prefetch(layer_id + 1)
+
+    def _submit_pcp_h2d_prefetch(self, layer_id: int) -> None:
+        pcp_load = getattr(self, "pcp_load", None)
+        if (
+            pcp_load is not None
+            and getattr(pcp_load, "prefetch_enabled", False)
+            and layer_id < self.num_layers
+            and self.layer_load_tasks[layer_id]
+        ):
+            assert self.kv_recv_thread is not None
+            # FIFO ownership: demand/overlap restore finishes before local
+            # staging is reused by the following layer's H2D-only lookahead.
+            self.kv_recv_thread.add_request(
+                LayerLoadTask(
+                    wait_for_save_layers=(),
+                    transfer_tasks=self.layer_load_tasks[layer_id],
+                    layer_id=layer_id,
+                    pcp_prefetch_only=True,
                 )
+            )
+
+    def _start_pcp_overlap_window(self, layer_id: int) -> None:
+        """Restore L+1 while L submits only local attention computation."""
+        next_layer = layer_id + 1
+        draft_start = getattr(self, "_dflash_draft_start_layer", None)
+        layer_limit = self.num_layers if draft_start is None else min(self.num_layers, draft_start)
+        if (
+            next_layer >= layer_limit
+            or self.next_layer_to_submit != next_layer
+            or not self.layer_load_tasks[next_layer]
+            or any(source >= layer_id for source in self.prefetch_layer_map.get(next_layer, ()))
+        ):
+            # A slot still read by L cannot be overwritten during L. Preserve
+            # demand loading for that layout and for draft/cold/empty tails.
+            return
+        assert self.pcp_load is not None and self.kv_recv_thread is not None
+        assert self._pcp_overlap_layer is None
+        self.kv_recv_thread.raise_if_failed()
+        # Finish prior model communication on auxiliary streams as well as the
+        # main stream (e.g. O-proj weight prefetch). No model collective may
+        # enter the explicitly bounded SFA compute window that follows.
+        with torch.profiler.record_function("kv_pool_pcp_overlap_entry_fence"):
+            torch.npu.synchronize(self.pcp_load.device)
+        self.kv_recv_thread.add_request(
+            LayerLoadTask(
+                wait_for_save_layers=self.prefetch_layer_map.get(next_layer, ()),
+                transfer_tasks=self.layer_load_tasks[next_layer],
+                layer_id=next_layer,
+            )
+        )
+        self._pcp_overlap_layer = next_layer
+        self.next_layer_to_submit = next_layer + 1
+        self._submit_pcp_h2d_prefetch(next_layer + 1)
+
+    def _finish_pcp_overlap_window(self) -> None:
+        """Join only the prefetched restore before the next model collective."""
+        layer_id = self._pcp_overlap_layer
+        if layer_id is None:
+            return
+        assert self.layer_load_finished_events is not None and self.kv_recv_thread is not None
+        try:
+            with torch.profiler.record_function("kv_pool_pcp_overlap_join"):
+                while not self.layer_load_finished_events[layer_id].wait(timeout=0.1):
+                    self.kv_recv_thread.raise_if_failed()
+                self.kv_recv_thread.raise_if_failed()
+            # The receiver sets this CPU event only after its stream completes.
+            # Keep it set for L+1's normal consumer; do not drain H2D lookahead.
+        except Exception:
+            self._layer_load_aborted.set()
+            raise
+        finally:
+            self._pcp_overlap_layer = None
 
     def wait_for_layer_load_ready(self, layer_name: str) -> None:
         physical_layer = self._extract_physical_layer_index(layer_name)
@@ -1759,6 +1828,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         gate = reset_attention_compute_start_gate()
         try:
             self.kv_recv_thread.raise_if_failed()
+            if getattr(getattr(self, "pcp_load", None), "overlap_enabled", False) is True:
+                layer_id = self.current_layer
+                gate.on_overlap_start = lambda: self._start_pcp_overlap_window(layer_id)
+                gate.on_overlap_finish = self._finish_pcp_overlap_window
             if getattr(self, "block_key_hybrid", False):
                 layer_id = self.current_layer
                 # Conv/recurrent state is updated inside attention, after this
