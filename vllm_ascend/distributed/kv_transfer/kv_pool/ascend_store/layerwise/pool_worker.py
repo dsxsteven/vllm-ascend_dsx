@@ -112,6 +112,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self._init_layerwise_config()
         self.pcp_load: PcpLayerwiseLoad | None = None
         self._pcp_overlap_layer: int | None = None
+        self._pcp_h2d_prefetch_layer: int | None = None
         self.pcp_load_enabled = (
             "kv_pool_pcp_h2d_allgather" in vllm_config.additional_config
             and get_ascend_config().kv_pool_pcp_h2d_allgather
@@ -713,6 +714,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self.layerwise_retrievers: list[Any] = []
         self.next_layer_to_submit = 0
         reset_attention_compute_start_gate()
+        self._pcp_h2d_prefetch_layer = None
         if self.use_kvpp:
             assert self.layer_load_finished_events is not None
             for event in self.layer_load_finished_events:
@@ -1698,15 +1700,21 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
             submitted = submit_layer_load(layer_id)
-            if submitted:
+            if submitted or getattr(self, "pcp_load", None) is not None:
+                # A resident/empty current layer still has compute that can
+                # hide the next layer's H2D. Do not wait for its LI/SFA hook.
                 self._submit_pcp_h2d_prefetch(layer_id + 1)
 
     def _submit_pcp_h2d_prefetch(self, layer_id: int) -> None:
         pcp_load = getattr(self, "pcp_load", None)
+        previous = getattr(self, "_pcp_h2d_prefetch_layer", None)
+        draft_start = getattr(self, "_dflash_draft_start_layer", None)
         if (
             pcp_load is not None
             and getattr(pcp_load, "prefetch_enabled", False)
             and layer_id < self.num_layers
+            and (previous is None or layer_id > previous)
+            and (draft_start is None or layer_id < draft_start)
             and self.layer_load_tasks[layer_id]
         ):
             assert self.kv_recv_thread is not None
@@ -1720,6 +1728,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     pcp_prefetch_only=True,
                 )
             )
+            self._pcp_h2d_prefetch_layer = layer_id
 
     def _start_pcp_overlap_window(self, layer_id: int) -> None:
         """Restore L+1 while L submits only local attention computation."""

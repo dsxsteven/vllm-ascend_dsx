@@ -24,6 +24,7 @@ def make_loader(monkeypatch, rank=0, world_size=2):
     loader.device = torch.device("cpu")
     loader._plan_cache = OrderedDict()
     loader._read_status = None
+    loader._status_needs_reset = True
     loader._control_status = torch.empty((), dtype=torch.int32)
     loader.prefetch_enabled = False
     loader.overlap_enabled = False
@@ -34,10 +35,15 @@ def make_loader(monkeypatch, rank=0, world_size=2):
     loader.copy_block_bytes = pcp_load.get_current_hardware_profile().pcp_kv_scatter_block_bytes
     loader.local = torch.full((pcp_load.SHARD_CAPACITY,), 0xFA, dtype=torch.uint8)
     loader.gathered = torch.full((pcp_load.SHARD_CAPACITY * world_size,), 0xFB, dtype=torch.uint8)
+    loader.gathered_buffers = [loader.gathered]
     loader.locals = [loader.local]
     loader.control_group = object()
     loader.device_group = object()
     loader.stream = MagicMock()
+    loader.scatter_stream = loader.stream
+    loader._gather_ready = [MagicMock(), MagicMock()]
+    loader._scatter_done = [MagicMock(), MagicMock()]
+    loader._batch_comm_done = MagicMock()
     loader.h2d_bytes = 0
     loader.restored_bytes = 0
     monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
@@ -157,6 +163,7 @@ def test_staging_is_aligned_and_communicators_are_separate(monkeypatch, prefetch
     real_device = torch.device
     monkeypatch.setattr(torch, "device", lambda *a, **kw: real_device("cpu"))
     monkeypatch.setattr(torch.npu, "Stream", lambda **kw: MagicMock())
+    monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
     monkeypatch.setattr(pcp_load, "create_hccl_pg_options", lambda name: SimpleNamespace(hccl_config={}))
     create_group = MagicMock(side_effect=[object(), object()])
     destroy_group = MagicMock()
@@ -171,6 +178,8 @@ def test_staging_is_aligned_and_communicators_are_separate(monkeypatch, prefetch
     assert loader.local.data_ptr() % (2 * 1024 * 1024) == 0
     assert loader.local.numel() == pcp_load.SHARD_CAPACITY
     assert loader.gathered.numel() == pcp_load.SHARD_CAPACITY * group.world_size
+    assert len(loader.gathered_buffers) == (2 if overlap else 1)
+    assert (loader.scatter_stream is not loader.stream) is overlap
     assert loader.control_group is not loader.device_group
     assert [call.kwargs["backend"] for call in create_group.call_args_list] == ["gloo", "hccl"]
     assert all(call.kwargs["ranks"] == [4, 5] for call in create_group.call_args_list)
@@ -551,12 +560,14 @@ def test_one_failed_read_rejects_the_entire_unpublished_batch(monkeypatch, faili
     loader.stream.synchronize.assert_called_once_with()
 
 
-def test_rank_pipeline_configuration_mismatch_is_rejected(monkeypatch):
+@pytest.mark.parametrize("field", [1, 2, 3, 4, 5])
+def test_rank_pipeline_configuration_mismatch_is_rejected(monkeypatch, field):
     loader = make_loader(monkeypatch)
 
     def gather(output, identity, **kwargs):
-        signature, windows, device_status, prefetch, overlap = identity
-        output[:] = [identity, (signature, windows + 1, device_status, prefetch, overlap)]
+        different = list(identity)
+        different[field] = not identity[field] if isinstance(identity[field], bool) else identity[field] + 1
+        output[:] = [identity, tuple(different)]
 
     monkeypatch.setattr(pcp_load.dist, "all_gather_object", gather)
     with pytest.raises(RuntimeError, match="plans differ"):

@@ -10,6 +10,37 @@ SHARD_CAPACITY = 32 * 1024 * 1024
 _COLLECTIVE_ALIGNMENT = 512
 
 
+def coalesce_copy_descriptors(
+    sources: np.ndarray, destinations: np.ndarray, lengths: np.ndarray, max_bytes: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Join adjacent source AND destination ranges, then bound each copy run.
+
+    Preserve descriptor order, holes and repeated destinations. The source may
+    be a packed offset rather than an absolute pointer. Bounding merged runs
+    prevents one program from serially copying an entire contiguous KV layer.
+    """
+    if max_bytes <= 0 or not (sources.shape == destinations.shape == lengths.shape) or lengths.ndim != 1:
+        raise ValueError("Invalid copy descriptor shape or run limit")
+    if np.any(lengths < 0):
+        raise ValueError("Invalid copy descriptor length")
+    valid = lengths > 0
+    sources, destinations, lengths = (np.asarray(x[valid], dtype=np.int64) for x in (sources, destinations, lengths))
+    if not len(lengths):
+        return sources, destinations, lengths
+    adjacent = (sources[1:] == sources[:-1] + lengths[:-1]) & (destinations[1:] == destinations[:-1] + lengths[:-1])
+    starts = np.concatenate(([0], np.flatnonzero(~adjacent) + 1))
+    run_lengths = np.add.reduceat(lengths, starts)
+    counts = (run_lengths + max_bytes - 1) // max_bytes
+    runs = np.repeat(np.arange(len(starts)), counts)
+    first = np.repeat(np.cumsum(counts) - counts, counts)
+    offsets = (np.arange(len(runs)) - first) * max_bytes
+    return (
+        sources[starts[runs]] + offsets,
+        destinations[starts[runs]] + offsets,
+        np.minimum(max_bytes, run_lengths[runs] - offsets),
+    )
+
+
 def slice_transfer(sizes: np.ndarray, start: int, end: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Map packed bytes to descriptor indices, source/packed offsets and sizes."""
     if start < 0 or end < start or np.any(sizes < 0):

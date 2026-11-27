@@ -7,6 +7,7 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pcp_load_plan import (
     SHARD_CAPACITY,
+    coalesce_copy_descriptors,
     shard_window,
     slice_transfer,
 )
@@ -78,3 +79,51 @@ def test_invalid_byte_range_rejected():
 def test_empty_interval_has_no_descriptors(position):
     for value in slice_transfer(np.array([10, 10]), position, position):
         assert value.size == 0
+
+
+@pytest.mark.parametrize("limit", [1, 17, 64, 256])
+@pytest.mark.parametrize("seed", [0, 7, 19])
+def test_copy_coalescing_preserves_every_byte_and_hole(limit, seed):
+    rng = np.random.default_rng(seed)
+    lengths = rng.integers(0, 48, size=80, dtype=np.int64)
+    src_gaps = rng.choice([0, 0, 0, 9], size=80)
+    dst_gaps = rng.choice([0, 0, 0, 13], size=80)
+    sources = np.cumsum(lengths + src_gaps) - lengths
+    destinations = np.cumsum(lengths + dst_gaps) - lengths
+    source = rng.integers(0, 256, size=int(sources[-1] + lengths[-1]), dtype=np.uint8)
+    expected = np.full(int(destinations[-1] + lengths[-1]) + 16, 0xA5, dtype=np.uint8)
+    actual = expected.copy()
+    for src, dst, size in zip(sources, destinations, lengths, strict=True):
+        expected[dst : dst + size] = source[src : src + size]
+    merged = coalesce_copy_descriptors(sources, destinations, lengths, limit)
+    for src, dst, size in zip(*merged, strict=True):
+        actual[dst : dst + size] = source[src : src + size]
+    np.testing.assert_array_equal(actual, expected)
+    assert int(merged[2].sum()) == int(lengths.sum())
+    assert np.all((merged[2] > 0) & (merged[2] <= limit))
+
+
+def test_copy_coalescing_only_merges_both_contiguous_addresses():
+    source = np.array([0, 16, 32, 48, 64, 80])
+    destination = np.array([100, 116, 200, 216, 216, 232])
+    result = coalesce_copy_descriptors(source, destination, np.full(6, 16), 64)
+    np.testing.assert_array_equal(result[0], [0, 32, 64])
+    np.testing.assert_array_equal(result[1], [100, 200, 216])
+    np.testing.assert_array_equal(result[2], [32, 32, 32])
+    empty = coalesce_copy_descriptors(np.array([1]), np.array([2]), np.array([0]), 64)
+    assert all(x.size == 0 for x in empty)
+
+
+@pytest.mark.parametrize("case", ["length", "shape", "dimension", "limit"])
+def test_invalid_copy_coalescing_is_rejected(case):
+    source, destination, length, limit = np.array([0]), np.array([100]), np.array([16]), 64
+    if case == "length":
+        length[0] = -1
+    elif case == "shape":
+        source = np.array([0, 16])
+    elif case == "dimension":
+        source, destination, length = (x.reshape(1, 1) for x in (source, destination, length))
+    else:
+        limit = 0
+    with pytest.raises(ValueError):
+        coalesce_copy_descriptors(source, destination, length, limit)
