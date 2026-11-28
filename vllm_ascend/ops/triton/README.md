@@ -56,6 +56,7 @@ These kernels are used on runner-neutral paths and keep their current paths.
 
 | Module | Shared use |
 | --- | --- |
+| [pcp_restore.py](pcp_restore.py) | PCP KV restoration with in-band failure status; [contract](docs/pcp_restore.md). |
 | [batch_memcpy.py](batch_memcpy.py) | Mamba copying and the KDA fallback copy plan installed by the model runner. |
 | [decoder_replay.py](decoder_replay.py) | Replay gathering in the V2 model state. |
 | [kda_state_copy_kernel.py](kda_state_copy_kernel.py) | KDA state-copy plans initialized by the model runner. |

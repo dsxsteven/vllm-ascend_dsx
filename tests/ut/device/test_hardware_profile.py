@@ -360,4 +360,3 @@ def test_pcp_kv_scatter_tuning_preserves_other_hardware(device_type):
     expected = 65536 if device_type is AscendDeviceType.A5 else 4096
     profile = get_hardware_profile(device_type)
     assert profile.pcp_kv_scatter_block_bytes == expected
-    assert profile.pcp_kv_device_status_reduce is (device_type is AscendDeviceType.A5)

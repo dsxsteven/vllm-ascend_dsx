@@ -54,6 +54,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     attention_transfer_window,
+    finish_attention_transfer_overlap,
     indexer_attention_transfer_window,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
@@ -2070,22 +2071,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_metadata: M,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert output is not None, "Output tensor must be provided."
-        if self._parallel_o_proj is None:
-            return self._forward_impl(layer_name, hidden_states, kv_cache, attn_metadata, output)
-        # A short prefill shard can look like decode locally. Preserve the
-        # global prefill decision so every PCP rank selects the same mode.
-        has_prefill = attn_metadata is not None and (
-            attn_metadata.pcp_has_global_prefill
-            or attn_metadata.attn_state
-            not in {
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            }
-        )
-        needs_global_metadata = attn_metadata is not None and (has_prefill or self.is_pcp_decode_sharded)
-        with self._parallel_o_proj.batch(needs_global_metadata=needs_global_metadata, has_prefill=has_prefill):
-            return self._forward_impl(layer_name, hidden_states, kv_cache, attn_metadata, output)
+        try:
+            assert output is not None, "Output tensor must be provided."
+            if self._parallel_o_proj is None:
+                return self._forward_impl(layer_name, hidden_states, kv_cache, attn_metadata, output)
+            # A short prefill shard can look like decode locally. Preserve the
+            # global prefill decision so every PCP rank selects the same mode.
+            has_prefill = attn_metadata is not None and (
+                attn_metadata.pcp_has_global_prefill
+                or attn_metadata.attn_state
+                not in {
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                }
+            )
+            needs_global_metadata = attn_metadata is not None and (has_prefill or self.is_pcp_decode_sharded)
+            with self._parallel_o_proj.batch(needs_global_metadata=needs_global_metadata, has_prefill=has_prefill):
+                return self._forward_impl(layer_name, hidden_states, kv_cache, attn_metadata, output)
+        except Exception:
+            finish_attention_transfer_overlap()
+            raise
 
     def _forward_impl(
         self,
@@ -2251,7 +2256,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         # and gather KV with the other ranks.
         has_local_query = attn_metadata.num_actual_tokens > 0
         # The indexer opens the window only after its model collectives.
-        with indexer_attention_transfer_window():
+        # TP/SP or sharded O-proj can communicate before the MoE boundary.
+        # Only extend the window through a verified local projection path.
+        parallel_o_proj = getattr(self, "_parallel_o_proj", None)
+        defer_join = (
+            getattr(self, "tp_size", None) == 1
+            and getattr(self, "enable_sp", True) is False
+            and (
+                parallel_o_proj is None
+                or not parallel_o_proj._weight_switch_enabled
+                or parallel_o_proj.uses_full_weight
+            )
+        )
+        with indexer_attention_transfer_window(defer_join=defer_join):
             if self.runtime_has_indexer:
                 # One unified indexer call: k path -> cache write -> top-k
                 # selection (the selection kernel reads the freshly written

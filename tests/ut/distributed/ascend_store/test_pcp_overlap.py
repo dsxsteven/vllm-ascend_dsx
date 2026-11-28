@@ -14,10 +14,8 @@ import pytest
 import torch
 
 from tests.ut.distributed.ascend_store.test_pcp_load import make_loader
-from vllm_ascend.device.hardware import AscendDeviceType
-from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import attention_fence
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise import pcp_load, pcp_load_plan, pool_worker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise import pcp_load, pool_worker
 
 
 def make_worker(monkeypatch, layer=2):
@@ -216,34 +214,25 @@ def test_mixed_overlap_flags_are_rejected_before_step(monkeypatch):
 @pytest.mark.parametrize("world_size", [2, 8, 16])
 @pytest.mark.parametrize("include_indexer", [False, True])
 def test_byte_exact_restore_executes_while_compute_is_inflight(monkeypatch, family, world_size, include_indexer):
-    monkeypatch.setattr(pcp_load, "SHARD_CAPACITY", 512)
-    monkeypatch.setattr(
-        pcp_load,
-        "shard_window",
-        lambda total, world, rank: pcp_load_plan.shard_window(total, world, rank, capacity=512),
-    )
-    loader = make_loader(monkeypatch, world_size=world_size)
-    profile = get_hardware_profile(getattr(AscendDeviceType, family))
-    loader.copy_block_bytes = profile.pcp_kv_scatter_block_bytes
-    loader._read_status = torch.empty((), dtype=torch.int32) if profile.pcp_kv_device_status_reduce else None
-    loader.overlap_enabled = loader.prefetch_enabled = True
-    loader.batch_windows = 3
-    loader.locals = [torch.empty(512, dtype=torch.uint8) for _ in range(3)]
+    loader = make_loader(monkeypatch, world_size=world_size, family=family, prefetch=True, overlap=True)
     source = torch.arange(world_size * 1024 + 13, dtype=torch.int64).to(torch.uint8)
     target = torch.full((source.numel() + 32,), 0xA5, dtype=torch.uint8)
     compute_submitted = threading.Event()
     restore_finished = threading.Event()
     errors = []
     calls = []
-    windows = iter(loader._get_transfer_plan(np.array([source.numel()])))
 
     def gather(output, local, *, group):
         assert compute_submitted.wait(timeout=5), "model compute was blocked before restore"
         assert group is loader.device_group
         calls.append("allgather_during_compute")
-        start, end, *_ = next(windows)
-        output.zero_()
-        output[: end - start].copy_(source[start:end])
+        payload = local.numel() - pcp_load._STATUS_BYTES
+        rows = output.view(world_size, local.numel())
+        rows.zero_()
+        for rank, row in enumerate(rows):
+            part = source[rank * payload : (rank + 1) * payload]
+            row[: part.numel()].copy_(part)
+        rows[loader.rank].copy_(local)
 
     def read(srcs, dsts, counts):
         for src, dst, count in zip(srcs, dsts, counts, strict=True):
@@ -295,7 +284,7 @@ def test_byte_exact_restore_executes_while_compute_is_inflight(monkeypatch, fami
     torch.npu.synchronize.assert_called_once_with(loader.device)
     assert calls.index("scatter_complete") < calls.index("next_model_collective")
     assert calls[-1] == "next_model_collective"
-    assert calls.count("allgather_during_compute") == 3
+    assert calls.count("allgather_during_compute") == 1
     assert torch.equal(target[16:-16], source)
     assert torch.all(target[:16] == 0xA5) and torch.all(target[-16:] == 0xA5)
     assert worker.layer_load_finished_events[3].is_set()

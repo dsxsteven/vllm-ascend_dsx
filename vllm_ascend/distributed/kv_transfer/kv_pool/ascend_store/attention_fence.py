@@ -46,6 +46,7 @@ class AttentionComputeStartGate:
         self.on_overlap_finish: Callable[[], None] | None = None
         self._event: torch.npu.Event | None = None
         self.indexer_scope_depth = 0
+        self.deferred_join_depth = 0
         self._overlap_started = False
         self._overlap_finished = False
 
@@ -103,6 +104,7 @@ def reset_attention_compute_start_gate() -> AttentionComputeStartGate:
     compute is about to be launched.
     """
     global _attention_compute_start_gate
+    finish_attention_transfer_overlap()
     gate = AttentionComputeStartGate()
     with _lock:
         _attention_compute_start_gate = gate
@@ -125,8 +127,16 @@ def record_attention_compute_start() -> None:
         gate.record()
 
 
+def finish_attention_transfer_overlap() -> None:
+    """Join deferred restore before model communication or the next KV user."""
+    with _lock:
+        gate = _attention_compute_start_gate
+    if gate is not None:
+        gate.finish_overlap()
+
+
 @contextmanager
-def indexer_attention_transfer_window():
+def indexer_attention_transfer_window(*, defer_join: bool = False):
     """Bound an optional local-LI start through the following SFA submission.
 
     Entering this scope does not start transfers: the indexer must first finish
@@ -138,12 +148,18 @@ def indexer_attention_transfer_window():
     if gate is None:
         yield
         return
+    # Legacy recurrent/save callbacks retain their original bounded window.
+    defer_join = defer_join and gate.on_finish is None
     gate.indexer_scope_depth += 1
+    gate.deferred_join_depth += int(defer_join)
+    failed = True
     try:
         yield
+        failed = False
     finally:
         gate.indexer_scope_depth -= 1
-        if gate.indexer_scope_depth == 0:
+        gate.deferred_join_depth -= int(defer_join)
+        if gate.indexer_scope_depth == 0 and (failed or not defer_join):
             gate.finish_overlap()
 
 
@@ -175,7 +191,7 @@ def attention_transfer_window(*, allow_pcp_overlap: bool = False):
         yield
     finally:
         try:
-            if allow_pcp_overlap:
+            if allow_pcp_overlap and not gate.deferred_join_depth:
                 gate.finish_overlap()
         finally:
             if gate.on_finish is not None:

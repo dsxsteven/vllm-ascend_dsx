@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import finish_attention_transfer_overlap
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe import moe_utils
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInput
@@ -112,6 +113,10 @@ class MoECommMethod(ABC):
         replace_allreduce: bool = False,
         quant_type: QuantType = QuantType.NONE,
     ) -> MoEPrepareOutput:
+        # MC2/All2All preparation only pads/slices local tensors. Keep CPU
+        # run-ahead through routing; other implementations can communicate here.
+        if type(self.prepare_finalize) not in (PrepareAndFinalizeWithMC2, PrepareAndFinalizeWithAll2All):
+            finish_attention_transfer_overlap()
         return self.prepare_finalize.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -151,6 +156,7 @@ class MoECommMethod(ABC):
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
         )
+        finish_attention_transfer_overlap()
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
         mlp_compute_input = build_mlp_compute_input(
@@ -651,6 +657,7 @@ class FusedMC2CommImpl(MoECommMethod):
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
 
+        finish_attention_transfer_overlap()
         expert_tokens = None
         if self.enable_fused_mc2 == 1:
             if _EXTRA_CTX.use_mega_moe:

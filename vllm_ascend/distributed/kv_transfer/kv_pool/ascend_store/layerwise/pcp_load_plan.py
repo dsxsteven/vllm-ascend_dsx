@@ -4,9 +4,6 @@
 
 import numpy as np
 
-# Amortize readiness reductions and HCCL/scatter launches on long prefixes.
-# Keep each shard below the private communicator's 64 MiB buffer.
-SHARD_CAPACITY = 32 * 1024 * 1024
 _COLLECTIVE_ALIGNMENT = 512
 
 
@@ -62,10 +59,16 @@ def slice_transfer_bounds(
     return indices, left - starts[indices], left - start, right - left
 
 
-def shard_window(total_bytes: int, world_size: int, rank: int, capacity: int = SHARD_CAPACITY):
+def shard_window(total_bytes: int, world_size: int, rank: int, capacity: int | None = None):
     """Yield window bounds, equal collective bytes, and the rank's byte range."""
     if total_bytes < 0 or world_size < 2 or not 0 <= rank < world_size:
         raise ValueError("Invalid PCP load topology or byte count")
+    if capacity is None:
+        capacity = max(
+            _COLLECTIVE_ALIGNMENT,
+            ((total_bytes + world_size * _COLLECTIVE_ALIGNMENT - 1) // (world_size * _COLLECTIVE_ALIGNMENT))
+            * _COLLECTIVE_ALIGNMENT,
+        )
     if capacity <= 0 or capacity % _COLLECTIVE_ALIGNMENT:
         raise ValueError("PCP shard capacity must be a positive multiple of 512 bytes")
     for start in range(0, total_bytes, capacity * world_size):
