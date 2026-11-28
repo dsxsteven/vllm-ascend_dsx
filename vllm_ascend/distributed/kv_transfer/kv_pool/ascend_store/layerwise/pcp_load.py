@@ -34,7 +34,9 @@ _BUFFER_ALIGNMENT = 2 * 1024 * 1024
 _GROUP_TIMEOUT = timedelta(minutes=2)
 _PLAN_CACHE_ENTRIES = 2
 _PREFETCH_SHARDS = 3
-_GATHER_BUFFERS = 2
+# Give every shard in a batch its own receive buffer so AG2 need not wait
+# for scatter0 to release storage while local LI computation is running.
+_GATHER_BUFFERS = 3
 _MIN_COPY_RUN_BYTES = 64 * 1024
 _COPY_RUN_TILES = 4
 

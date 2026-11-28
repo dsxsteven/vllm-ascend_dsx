@@ -41,8 +41,8 @@ def make_loader(monkeypatch, rank=0, world_size=2):
     loader.device_group = object()
     loader.stream = MagicMock()
     loader.scatter_stream = loader.stream
-    loader._gather_ready = [MagicMock(), MagicMock()]
-    loader._scatter_done = [MagicMock(), MagicMock()]
+    loader._gather_ready = [MagicMock() for _ in range(pcp_load._GATHER_BUFFERS)]
+    loader._scatter_done = [MagicMock() for _ in range(pcp_load._GATHER_BUFFERS)]
     loader._batch_comm_done = MagicMock()
     loader.h2d_bytes = 0
     loader.restored_bytes = 0
@@ -178,7 +178,9 @@ def test_staging_is_aligned_and_communicators_are_separate(monkeypatch, prefetch
     assert loader.local.data_ptr() % (2 * 1024 * 1024) == 0
     assert loader.local.numel() == pcp_load.SHARD_CAPACITY
     assert loader.gathered.numel() == pcp_load.SHARD_CAPACITY * group.world_size
-    assert len(loader.gathered_buffers) == (2 if overlap else 1)
+    assert len(loader.gathered_buffers) == (3 if overlap else 1)
+    assert len({buffer.data_ptr() for buffer in loader.gathered_buffers}) == len(loader.gathered_buffers)
+    assert len(loader._gather_ready) == len(loader._scatter_done) == (3 if overlap else 0)
     assert (loader.scatter_stream is not loader.stream) is overlap
     assert loader.control_group is not loader.device_group
     assert [call.kwargs["backend"] for call in create_group.call_args_list] == ["gloo", "hccl"]

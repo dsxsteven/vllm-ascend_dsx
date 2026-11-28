@@ -72,7 +72,8 @@ def defer_metadata_copy(monkeypatch, loader, active, calls):
     return original_copy
 
 
-def pipeline_case(monkeypatch, family, world, rank):
+def pipeline_case(monkeypatch, family, world, rank, gather_buffers=None):
+    gather_buffers = pcp_load._GATHER_BUFFERS if gather_buffers is None else gather_buffers
     capacity = 512
     monkeypatch.setattr(pcp_load, "SHARD_CAPACITY", capacity)
     monkeypatch.setattr(
@@ -83,11 +84,11 @@ def pipeline_case(monkeypatch, family, world, rank):
     loader.batch_windows = 3
     loader.locals = [torch.empty(capacity, dtype=torch.uint8) for _ in range(3)]
     loader.local = loader.locals[0]
-    loader.gathered_buffers = [torch.empty(capacity * world, dtype=torch.uint8) for _ in range(2)]
+    loader.gathered_buffers = [torch.empty(capacity * world, dtype=torch.uint8) for _ in range(gather_buffers)]
     loader.gathered = loader.gathered_buffers[0]
     loader.stream, loader.scatter_stream = DeferredStream(), DeferredStream()
-    loader._gather_ready = [DeferredEvent(), DeferredEvent()]
-    loader._scatter_done = [DeferredEvent(), DeferredEvent()]
+    loader._gather_ready = [DeferredEvent() for _ in range(gather_buffers)]
+    loader._scatter_done = [DeferredEvent() for _ in range(gather_buffers)]
     loader._batch_comm_done = DeferredEvent()
     profile = get_hardware_profile(getattr(AscendDeviceType, family))
     loader.copy_block_bytes = profile.pcp_kv_scatter_block_bytes
@@ -153,7 +154,8 @@ def pipeline_case(monkeypatch, family, world, rank):
     def finish_copy_stream():
         loader.scatter_stream.host_waits += 1
         # Exercise a legal schedule that advances communication before copies.
-        # Buffer reuse must stop AG2 until scatter0 has consumed buffer0.
+        # Two buffers must stop AG2 for scatter0; three can finish the whole
+        # batch's communication before scatter consumes any receive buffer.
         loader.stream.drain()
         loader.scatter_stream.drain()
 
@@ -166,8 +168,13 @@ def pipeline_case(monkeypatch, family, world, rank):
 @pytest.mark.parametrize("family", ["A3", "A5"])
 @pytest.mark.parametrize("world,rank", [(2, 0), (8, 7), (16, 15)])
 @pytest.mark.parametrize("prefetch", [False, True])
-def test_pipeline_byte_exact_with_delayed_streams_and_buffer_reuse(monkeypatch, family, world, rank, prefetch):
-    loader, sources, targets, gvas, addrs, sizes, read, calls = pipeline_case(monkeypatch, family, world, rank)
+@pytest.mark.parametrize("gather_buffers", [2, 3])
+def test_pipeline_byte_exact_with_delayed_streams_and_buffer_reuse(
+    monkeypatch, family, world, rank, prefetch, gather_buffers
+):
+    loader, sources, targets, gvas, addrs, sizes, read, calls = pipeline_case(
+        monkeypatch, family, world, rank, gather_buffers
+    )
     for step in range(2):
         for source in sources:
             source.add_(23 + step)
@@ -178,31 +185,63 @@ def test_pipeline_byte_exact_with_delayed_streams_and_buffer_reuse(monkeypatch, 
         for source, target in zip(sources, targets, strict=True):
             assert torch.equal(source, target[16:-16])
             assert torch.all(target[:16] == 0xA5) and torch.all(target[-16:] == 0xA5)
-    assert calls.index(("gather", 1)) < calls.index(("scatter", 0)) < calls.index(("gather", 2))
+    if gather_buffers == 2:
+        assert calls.index(("gather", 1)) < calls.index(("scatter", 0)) < calls.index(("gather", 2))
+    else:
+        for first in (0, 3, 7, 10):
+            assert calls.index(("gather", first + 2)) < calls.index(("scatter", first))
     assert calls.count("metadata_submit") == 6  # Seven windows, three batches per step.
     assert loader.scatter_stream.host_waits == 6 and loader.stream.host_waits == 0
     assert loader.restored_bytes == 2 * int(sizes.sum())
 
 
-@pytest.mark.parametrize("stage", ["gather", "scatter", "ready_event", "comm_done", "metadata"])
-def test_pipeline_partial_enqueue_failure_drains_both_streams(monkeypatch, stage):
-    loader, _, _, gvas, addrs, sizes, read, _ = pipeline_case(monkeypatch, "A5", 8, 7)
-    if stage == "gather":
+@pytest.mark.parametrize("family", ["A3", "A5"])
+def test_default_three_buffers_gather_whole_batch_before_delayed_scatter(monkeypatch, family):
+    loader, sources, targets, gvas, addrs, sizes, read, calls = pipeline_case(monkeypatch, family, 8, 7)
+    assert len(loader.gathered_buffers) == 3
+    loader.copy(gvas, addrs, sizes, read)
+    for first in (0, 3):
+        assert calls.index(("gather", first + 2)) < calls.index(("scatter", first))
+    # A new batch may reuse its buffer only after the previous batch's copy.
+    assert calls.index(("scatter", 2)) < calls.index(("gather", 3))
+    assert calls.index(("scatter", 5)) < calls.index(("gather", 6))
+    for source, target in zip(sources, targets, strict=True):
+        assert torch.equal(source, target[16:-16])
+        assert torch.all(target[:16] == 0xA5) and torch.all(target[-16:] == 0xA5)
+
+
+@pytest.mark.parametrize("family", ["A3", "A5"])
+@pytest.mark.parametrize(
+    "stage", ["gather", "gather3", "scatter", "scatter3", "ready_event", "ready_event3", "comm_done", "metadata"]
+)
+def test_pipeline_partial_enqueue_failure_drains_both_streams(monkeypatch, stage, family):
+    loader, _, _, gvas, addrs, sizes, read, _ = pipeline_case(monkeypatch, family, 8, 7)
+    if stage in ("gather", "gather3"):
         original = pcp_load.dist.all_gather_into_tensor
         calls = 0
 
-        def fail_second(*args, **kwargs):
+        def fail_gather(*args, **kwargs):
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if calls == (3 if stage == "gather3" else 2):
                 raise RuntimeError("injected gather")
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(pcp_load.dist, "all_gather_into_tensor", fail_second)
+        monkeypatch.setattr(pcp_load.dist, "all_gather_into_tensor", fail_gather)
     elif stage == "scatter":
         monkeypatch.setattr(loader, "_scatter", MagicMock(side_effect=RuntimeError("injected scatter")))
-    elif stage == "ready_event":
-        monkeypatch.setattr(loader._gather_ready[0], "record", MagicMock(side_effect=RuntimeError("injected event")))
+    elif stage == "scatter3":
+        original_scatter = loader._scatter
+
+        def fail_third_scatter(slot, count):
+            if slot == 2:
+                raise RuntimeError("injected scatter")
+            original_scatter(slot, count)
+
+        monkeypatch.setattr(loader, "_scatter", fail_third_scatter)
+    elif stage in ("ready_event", "ready_event3"):
+        event = loader._gather_ready[2 if stage == "ready_event3" else 0]
+        monkeypatch.setattr(event, "record", MagicMock(side_effect=RuntimeError("injected event")))
     elif stage == "comm_done":
         monkeypatch.setattr(loader._batch_comm_done, "record", MagicMock(side_effect=RuntimeError("injected event")))
     else:
